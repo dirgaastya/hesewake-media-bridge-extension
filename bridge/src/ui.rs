@@ -1,0 +1,302 @@
+//! What the notch is told to show for the "Phone" slide: the paired phones, the pairing request with its code and the
+//! Approve / Reject buttons, and a page per phone. State in, JSON pages out; nothing here touches the notch or the server,
+//! so the pages and what a click means are tested directly.
+
+use crate::pairing::Device;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+/// What a click asks the program to do.
+#[derive(Debug, PartialEq)]
+pub enum Do {
+    OpenPairing,
+    ClosePairing,
+    Decide(bool),
+    Forget(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum View {
+    Home,
+    Device(String),
+}
+
+pub struct Ui {
+    rev: u64,
+    devices: Vec<Device>,
+    connected: Option<String>,
+    playing: Option<(String, String)>,
+    pairing_left: Option<Duration>,
+    /// The six digits of the pairing that waits for the user's decision.
+    request: Option<String>,
+    view: View,
+}
+
+fn short(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// `2026-11-01` from unix seconds.
+fn date(unix: u64) -> String {
+    let z = (unix / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+impl Default for Ui {
+    fn default() -> Ui {
+        Ui { rev: 0, devices: Vec::new(), connected: None, playing: None, pairing_left: None, request: None, view: View::Home }
+    }
+}
+
+impl Ui {
+    pub fn set_devices(&mut self, d: Vec<Device>) {
+        self.devices = d;
+        if let View::Device(id) = &self.view {
+            if !self.devices.iter().any(|x| &x.id == id) {
+                self.view = View::Home;
+            }
+        }
+    }
+
+    pub fn set_connected(&mut self, id: Option<String>) {
+        self.connected = id;
+    }
+
+    pub fn set_playing(&mut self, now: Option<(String, String)>) {
+        self.playing = now;
+    }
+
+    pub fn set_pairing_left(&mut self, left: Option<Duration>) {
+        self.pairing_left = left;
+    }
+
+    pub fn set_request(&mut self, code: Option<String>) {
+        self.request = code;
+    }
+
+    pub fn has_request(&self) -> bool {
+        self.request.is_some()
+    }
+
+    pub fn pairing_open(&self) -> bool {
+        self.pairing_left.is_some()
+    }
+
+    fn next_rev(&mut self) -> u64 {
+        self.rev += 1;
+        self.rev
+    }
+
+    fn name_of(&self, id: &str) -> String {
+        self.devices.iter().find(|d| d.id == id).map_or_else(|| "Phone".to_string(), |d| d.name.clone())
+    }
+
+    /// The text for the Settings page's status line.
+    pub fn status(&self) -> String {
+        let who = self.connected.as_deref().map(|id| self.name_of(id));
+        match (&self.request, who, &self.playing) {
+            (Some(_), _, _) => "Pairing request".to_string(),
+            (None, Some(w), Some((t, _))) => short(&format!("{w}: {t}"), 60),
+            (None, Some(w), None) => short(&format!("{w} connected"), 60),
+            (None, None, _) if self.pairing_left.is_some() => "Waiting for a phone".to_string(),
+            (None, None, _) if self.devices.is_empty() => "No phone paired".to_string(),
+            _ => "Waiting for a paired phone".to_string(),
+        }
+    }
+
+    /// The page to show now: a pairing request comes first, then the phone that was clicked, then the list.
+    pub fn page(&mut self) -> Value {
+        let rev = self.next_rev();
+        if let Some(code) = &self.request {
+            return json!({
+                "t": "detail", "rev": rev, "for": "pair", "title": "Pair this phone?",
+                "meta": [{"k": "Code", "v": code}],
+                "body": "Check that your phone shows the same six digits, then approve here and on the phone.",
+                "buttons": [{"id": "approve", "label": "Approve"}, {"id": "reject", "label": "Reject"}],
+                "foot": "Both sides must approve"
+            });
+        }
+        if let View::Device(id) = self.view.clone() {
+            if let Some(d) = self.devices.iter().find(|d| d.id == id) {
+                let on = self.connected.as_deref() == Some(id.as_str());
+                return json!({
+                    "t": "detail", "rev": rev, "for": id, "title": short(&d.name, 60),
+                    "meta": [{"k": "Status", "v": if on { "Connected" } else { "Offline" }}, {"k": "Paired", "v": date(d.added)}],
+                    "body": "Forget this phone to take away its access. It has to pair again to come back.",
+                    "buttons": [{"id": format!("forget:{id}"), "label": "Forget"}]
+                });
+            }
+        }
+        let rows: Vec<Value> = self
+            .devices
+            .iter()
+            .map(|d| json!({"id": d.id, "text": short(&d.name, 60), "sub": if self.connected.as_deref() == Some(d.id.as_str()) { "Connected" } else { "Offline" }}))
+            .collect();
+        let foot = match (&self.pairing_left, &self.playing) {
+            (Some(left), _) => format!("Waiting for a phone \u{b7} {}:{:02} left", left.as_secs() / 60, left.as_secs() % 60),
+            (None, Some((t, a))) => short(&format!("{t} \u{b7} {a}"), 100),
+            _ => String::new(),
+        };
+        let action = if self.pairing_left.is_some() { json!({"id": "pair_cancel", "label": "Cancel"}) } else { json!({"id": "pair", "label": "Pair a phone"}) };
+        let mut page = json!({"t": "slide", "rev": rev, "title": "Pho|ne", "actions": [action], "rows": rows, "foot": foot});
+        if self.devices.is_empty() {
+            page["state"] = json!("empty");
+            page["message"] = json!(if self.pairing_left.is_some() { "Open Hesewake Media Bridge on your phone and pick this PC." } else { "No phone is paired yet. Press Pair a phone." });
+        }
+        page
+    }
+
+    /// A row was clicked: a phone opens its page.
+    pub fn row(&mut self, id: &str) -> bool {
+        if self.devices.iter().any(|d| d.id == id) {
+            self.view = View::Device(id.to_string());
+            return true;
+        }
+        false
+    }
+
+    pub fn back(&mut self) {
+        self.view = View::Home;
+    }
+
+    /// A button was clicked.
+    pub fn action(&mut self, id: &str) -> Option<Do> {
+        match id {
+            "pair" => Some(Do::OpenPairing),
+            "pair_cancel" => Some(Do::ClosePairing),
+            "approve" if self.request.is_some() => Some(Do::Decide(true)),
+            "reject" if self.request.is_some() => Some(Do::Decide(false)),
+            f if f.starts_with("forget:") && self.devices.iter().any(|d| d.id == f[7..]) => {
+                self.view = View::Home;
+                Some(Do::Forget(f[7..].to_string()))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pairing::Devices;
+
+    fn phones(n: u8) -> Vec<Device> {
+        let mut d = Devices::default();
+        for i in 0..n {
+            d.add(&[i + 1; 32], 1_793_491_200 + i as u64 * 86_400);
+        }
+        d.list().to_vec()
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(1_793_491_200), "2026-11-01");
+        assert_eq!(date(951_782_400), "2000-02-29");
+        assert_eq!(date(1_709_164_800 + 86_399), "2024-02-29");
+    }
+
+    #[test]
+    fn an_empty_home_says_what_to_do() {
+        let mut ui = Ui::default();
+        let p = ui.page();
+        assert_eq!((p["t"].as_str(), p["state"].as_str(), p["actions"][0]["id"].as_str()), (Some("slide"), Some("empty"), Some("pair")));
+        assert!(p["message"].as_str().unwrap().contains("Pair a phone"));
+        assert_eq!(ui.status(), "No phone paired");
+        ui.set_pairing_left(Some(Duration::from_secs(95)));
+        let p = ui.page();
+        assert_eq!(p["actions"][0]["id"], "pair_cancel");
+        assert_eq!(p["foot"], "Waiting for a phone \u{b7} 1:35 left");
+        assert!(p["message"].as_str().unwrap().contains("on your phone"));
+        assert_eq!(ui.status(), "Waiting for a phone");
+    }
+
+    #[test]
+    fn the_list_shows_who_is_connected_and_what_plays() {
+        let mut ui = Ui::default();
+        let d = phones(2);
+        let (a, b) = (d[0].id.clone(), d[1].id.clone());
+        ui.set_devices(d);
+        ui.set_connected(Some(b.clone()));
+        ui.set_playing(Some(("A Song".into(), "An Artist".into())));
+        let p = ui.page();
+        assert!(p.get("state").is_none(), "rows, not an empty page");
+        let rows = p["rows"].as_array().unwrap();
+        assert_eq!((rows[0]["id"].as_str(), rows[0]["sub"].as_str()), (Some(a.as_str()), Some("Offline")));
+        assert_eq!((rows[1]["text"].as_str(), rows[1]["sub"].as_str()), (Some("Phone 2"), Some("Connected")));
+        assert_eq!(p["foot"], "A Song \u{b7} An Artist");
+        assert_eq!(ui.status(), "Phone 2: A Song");
+        ui.set_playing(None);
+        assert_eq!(ui.status(), "Phone 2 connected");
+        ui.set_connected(None);
+        assert_eq!(ui.status(), "Waiting for a paired phone");
+    }
+
+    #[test]
+    fn a_pairing_request_takes_over_until_it_is_decided() {
+        let mut ui = Ui::default();
+        ui.set_devices(phones(1));
+        ui.set_request(Some("667512".into()));
+        let p = ui.page();
+        assert_eq!((p["t"].as_str(), p["for"].as_str(), p["meta"][0]["v"].as_str()), (Some("detail"), Some("pair"), Some("667512")));
+        assert_eq!(p["buttons"][0]["id"], "approve");
+        assert_eq!(ui.status(), "Pairing request");
+        assert_eq!(ui.action("approve"), Some(Do::Decide(true)));
+        assert_eq!(ui.action("reject"), Some(Do::Decide(false)));
+        ui.set_request(None);
+        assert_eq!(ui.action("approve"), None, "nothing to approve any more");
+        assert_eq!(ui.page()["t"], "slide");
+    }
+
+    #[test]
+    fn a_phone_has_a_page_and_can_be_forgotten() {
+        let mut ui = Ui::default();
+        let d = phones(2);
+        let id = d[0].id.clone();
+        ui.set_devices(d);
+        assert!(ui.row(&id));
+        assert!(!ui.row("not-a-phone"));
+        let p = ui.page();
+        assert_eq!((p["t"].as_str(), p["title"].as_str(), p["meta"][1]["v"].as_str()), (Some("detail"), Some("Phone 1"), Some("2026-11-01")));
+        let forget = p["buttons"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(ui.action("forget:nobody"), None, "only a phone that is paired");
+        assert_eq!(ui.action(&forget), Some(Do::Forget(id.clone())));
+        assert_eq!(ui.page()["t"], "slide", "back at the list");
+        ui.row(&id);
+        ui.back();
+        assert_eq!(ui.page()["t"], "slide");
+        // a phone that disappears while its page is open
+        ui.row(&id);
+        ui.set_devices(phones(0));
+        assert_eq!(ui.page()["t"], "slide");
+    }
+
+    #[test]
+    fn pairing_buttons_and_revisions() {
+        let mut ui = Ui::default();
+        assert_eq!(ui.action("pair"), Some(Do::OpenPairing));
+        assert_eq!(ui.action("pair_cancel"), Some(Do::ClosePairing));
+        assert_eq!(ui.action("something-else"), None);
+        let (a, b) = (ui.page()["rev"].as_u64().unwrap(), ui.page()["rev"].as_u64().unwrap());
+        assert!(b > a, "every page is newer than the one before");
+    }
+
+    #[test]
+    fn long_names_are_cut_for_the_notch() {
+        let mut ui = Ui::default();
+        let mut d = phones(1);
+        ui.set_devices(d.drain(..).collect());
+        ui.set_connected(Some(ui.devices[0].id.clone()));
+        ui.set_playing(Some(("T".repeat(200), "A".into())));
+        assert!(ui.status().chars().count() <= 60);
+        assert!(ui.page()["foot"].as_str().unwrap().chars().count() <= 100);
+    }
+}
