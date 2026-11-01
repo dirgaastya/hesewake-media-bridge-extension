@@ -109,6 +109,9 @@ fn main() {
     let mut one_way = Duration::ZERO;
     // when the phone was last lost (for the "connected" toast)
     let mut gone_at = None::<Instant>;
+    // the phone the page considers connected: one that signs in again while it is (a second connection replaces the first, and
+    // its Connected comes before the old one's Disconnected) is not a new arrival
+    let mut live = None::<String>;
     // the song's picture for the page, made once per picture; and what the page last said about the song
     let mut thumbs = Thumbs::default();
     let mut last_hero = None::<(String, String, bool, bool)>;
@@ -197,9 +200,11 @@ fn main() {
             }
             Msg::Server(Event::Connected { id, name }) => {
                 ui.set_devices(server.devices());
+                let again = live.as_deref() == Some(id.as_str());
+                live = Some(id.clone());
                 ui.set_connected(Some(id));
                 // a phone that comes back within a minute and a half is the same stay, not news: no toast every time
-                if gone_at.is_none_or(|t| t.elapsed() > Duration::from_secs(90)) {
+                if !again && gone_at.is_none_or(|t| t.elapsed() > Duration::from_secs(90)) {
                     toast(&format!("{name} connected"), "Media Bridge");
                 }
                 page(&mut ui);
@@ -210,6 +215,7 @@ fn main() {
                 log::note(&format!("page told: disconnected ({why})"));
                 // a phone that signs in again is already the connected one by now
                 if server.connected().is_none() {
+                    live = None;
                     one_way = Duration::ZERO;
                     ui.set_connected(None);
                     ui.set_playing(None);
