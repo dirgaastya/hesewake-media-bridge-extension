@@ -211,6 +211,7 @@ impl Server {
         let id = uuid_v4();
         let a = self.inner.active.lock().ok()?;
         a.as_ref()?.tx.send(wire::command(&id, action, position_ms)).ok()?;
+        crate::log::note(&format!("command {} sent ({})", action.name(), &id[..8]));
         Some(id)
     }
 }
@@ -411,6 +412,7 @@ impl Inner {
         let (mut latency, mut sent, mut burst) = (Latency::default(), Vec::<(String, Instant)>::new(), 4u32);
         let mut burst_at = Instant::now();
         let mut keep = wire::ArtworkKeep::default();
+        let mut last_state = None::<(bool, bool)>;
         loop {
             if !self.active.lock().is_ok_and(|a| a.as_ref().is_some_and(|a| a.generation == generation)) {
                 why = "replaced or forgotten";
@@ -455,9 +457,18 @@ impl Inner {
                             }
                             last_seq = Some(s.seq);
                             keep.resolve(&mut s);
+                            // what the phone says it plays changes now and then: noted, without the song
+                            let now_state = (s.active, s.playing);
+                            if last_state != Some(now_state) {
+                                crate::log::note(&format!("phone reports active={} playing={} source={}", s.active, s.playing, s.source));
+                                last_state = Some(now_state);
+                            }
                             self.emit(Event::Snapshot(s));
                         }
-                        FromPhone::Ack { id, accepted, reason } => self.emit(Event::Ack { id, accepted, reason }),
+                        FromPhone::Ack { id, accepted, reason } => {
+                            crate::log::note(&format!("ack {} accepted={accepted} {reason}", id.get(..8).unwrap_or("")));
+                            self.emit(Event::Ack { id, accepted, reason });
+                        }
                         // pairing or signing in again on a signed-in connection
                         FromPhone::Forget => {
                             let name = self.devices.lock().ok().and_then(|d| d.list().iter().find(|x| x.id == id).map(|x| x.name.clone())).unwrap_or_default();
