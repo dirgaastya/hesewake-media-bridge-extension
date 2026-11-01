@@ -29,7 +29,9 @@ pub enum Event {
     PairEnded { paired: bool },
     /// A paired phone is connected and signed in.
     Connected { id: String, name: String },
-    Disconnected { id: String },
+    /// Why it ended: `closed by the phone`, `bad frame`, `idle`, `write failed`, `seq went back`, `unexpected message` or
+    /// `replaced or forgotten`.
+    Disconnected { id: String, why: &'static str },
     Snapshot(Snapshot),
     /// How long a message from the phone takes to get here now (one way), as far as the pings can tell.
     Latency(Duration),
@@ -364,13 +366,17 @@ impl Inner {
             *a = Some(Active { id: id.clone(), tx, generation });
         }
         let name = self.devices.lock().ok().and_then(|d| d.list().iter().find(|x| x.id == id).map(|x| x.name.clone())).unwrap_or_default();
+        crate::log::note(&format!("phone {id} connected"));
         self.emit(Event::Connected { id: id.clone(), name });
+        // what the log says when it ends: why, how long, how many frames and the longest wait between two
+        let (started, mut frames, mut longest, mut last_frame, mut why) = (Instant::now(), 0u64, Duration::ZERO, Instant::now(), "closed by the phone");
         let (mut seen, mut pinged, mut last_seq) = (Instant::now(), Instant::now(), None::<u64>);
         // a few quick pings first, so the delay is known when the first song arrives; then one now and then
         let (mut latency, mut sent, mut burst) = (Latency::default(), Vec::<(String, Instant)>::new(), 4u32);
         let mut burst_at = Instant::now();
         loop {
             if !self.active.lock().is_ok_and(|a| a.as_ref().is_some_and(|a| a.generation == generation)) {
+                why = "replaced or forgotten";
                 break;
             }
             while let Ok(frame) = rx.try_recv() {
@@ -379,13 +385,20 @@ impl Inner {
                 }
             }
             match c.poll() {
-                Poll::Closed | Poll::Bad => break,
+                Poll::Closed => break,
+                Poll::Bad => {
+                    why = "bad frame";
+                    break;
+                }
                 Poll::Idle => {}
                 Poll::Frame(m) => {
-                    seen = Instant::now();
+                    let now = Instant::now();
+                    longest = longest.max(now.saturating_duration_since(last_frame));
+                    (seen, last_frame, frames) = (now, now, frames + 1);
                     match m {
                         FromPhone::Ping { id } => {
                             if !c.send(&wire::pong(&id)) {
+                                why = "write failed";
                                 break;
                             }
                         }
@@ -400,6 +413,7 @@ impl Inner {
                         FromPhone::Snapshot(s) => {
                             // `seq` only goes up: an old or repeated one is a phone that is confused, or something else
                             if last_seq.is_some_and(|l| s.seq <= l) {
+                                why = "seq went back";
                                 break;
                             }
                             last_seq = Some(s.seq);
@@ -407,7 +421,10 @@ impl Inner {
                         }
                         FromPhone::Ack { id, accepted, reason } => self.emit(Event::Ack { id, accepted, reason }),
                         // pairing or signing in again on a signed-in connection
-                        FromPhone::PairHello { .. } | FromPhone::PairDecision { .. } | FromPhone::Auth { .. } => break,
+                        FromPhone::PairHello { .. } | FromPhone::PairDecision { .. } | FromPhone::Auth { .. } => {
+                            why = "unexpected message";
+                            break;
+                        }
                     }
                 }
             }
@@ -424,10 +441,12 @@ impl Inner {
                 }
                 pinged = Instant::now();
                 if !c.send(&wire::ping(&id)) {
+                    why = "write failed";
                     break;
                 }
             }
             if seen.elapsed() >= self.timing.idle {
+                why = "idle";
                 break;
             }
         }
@@ -436,7 +455,8 @@ impl Inner {
                 *a = None;
             }
         }
-        self.emit(Event::Disconnected { id });
+        crate::log::note(&format!("phone {id} gone: {why} after {} s, {frames} frames, longest wait {} ms", started.elapsed().as_secs(), longest.as_millis()));
+        self.emit(Event::Disconnected { id, why });
     }
 }
 

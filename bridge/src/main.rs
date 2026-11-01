@@ -4,6 +4,7 @@
 
 use hesewake_media_bridge::advert::Advert;
 use hesewake_media_bridge::invite;
+use hesewake_media_bridge::log;
 use hesewake_media_bridge::identity::Identity;
 use hesewake_media_bridge::media::{Playing, State};
 use hesewake_media_bridge::notch::{FromNotch, Link};
@@ -66,6 +67,8 @@ fn main() {
         std::process::exit(2);
     };
     let dir = data_dir();
+    log::init(dir.join("bridge.log"));
+    log::note(&format!("started {}", env!("CARGO_PKG_VERSION")));
     let identity = Identity::load_or_create(&dir).expect("a TLS identity");
     let (ev_tx, ev_rx) = channel();
     let tls = hesewake_media_bridge::tls::server_config(&identity).expect("a TLS configuration");
@@ -104,6 +107,8 @@ fn main() {
     let mut visible = false;
     // how long a snapshot takes to get here, from the pings; the song's position is moved on by it
     let mut one_way = Duration::ZERO;
+    // when the phone was last lost (for the "connected" toast)
+    let mut gone_at = None::<Instant>;
     // the song's picture for the page, made once per picture; and what the page last said about the song
     let mut thumbs = Thumbs::default();
     let mut last_hero = None::<(String, String, bool, bool)>;
@@ -193,11 +198,16 @@ fn main() {
             Msg::Server(Event::Connected { id, name }) => {
                 ui.set_devices(server.devices());
                 ui.set_connected(Some(id));
-                toast(&format!("{name} connected"), "Media Bridge");
+                // a phone that comes back within a minute and a half is the same stay, not news: no toast every time
+                if gone_at.is_none_or(|t| t.elapsed() > Duration::from_secs(90)) {
+                    toast(&format!("{name} connected"), "Media Bridge");
+                }
                 page(&mut ui);
                 status(&ui);
             }
-            Msg::Server(Event::Disconnected { .. }) => {
+            Msg::Server(Event::Disconnected { why, .. }) => {
+                gone_at = Some(Instant::now());
+                log::note(&format!("page told: disconnected ({why})"));
                 // a phone that signs in again is already the connected one by now
                 if server.connected().is_none() {
                     one_way = Duration::ZERO;

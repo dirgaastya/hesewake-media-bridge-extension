@@ -5,6 +5,7 @@ pub mod dpapi;
 pub mod identity;
 pub mod invite;
 pub mod latency;
+pub mod log;
 pub mod media;
 pub mod notch;
 pub mod pairing;
