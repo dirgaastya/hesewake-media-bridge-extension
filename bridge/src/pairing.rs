@@ -15,6 +15,8 @@ pub const MODE: Duration = Duration::from_secs(120);
 const MAX_FAILS: u32 = 5;
 const LOCK: Duration = Duration::from_secs(60);
 pub const MAX_DEVICES: usize = 8;
+/// The longest name of a phone, in characters.
+pub const MAX_NAME: usize = 32;
 
 #[derive(Debug, PartialEq)]
 pub enum Refusal {
@@ -134,6 +136,19 @@ impl Devices {
         self.list.last()
     }
 
+    /// A new name for a phone: control characters dropped, the ends trimmed, at most `MAX_NAME` characters. The cleaned name
+    /// if it was taken (it is never empty), None if there is no such phone or nothing is left of the name.
+    pub fn rename(&mut self, id: &str, name: &str) -> Option<String> {
+        let clean: String = name.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(MAX_NAME).collect();
+        let clean = clean.trim().to_string();
+        if clean.is_empty() {
+            return None;
+        }
+        let d = self.list.iter_mut().find(|d| d.id == id)?;
+        d.name = clean.clone();
+        Some(clean)
+    }
+
     /// "Forget this phone": its token stops working.
     pub fn forget(&mut self, id: &str) -> bool {
         let before = self.list.len();
@@ -158,7 +173,7 @@ impl Devices {
             if list.iter().any(|x| x.id == id || x.hash == hash) {
                 continue;
             }
-            let name = d.get("name").and_then(Value::as_str).unwrap_or("Phone").chars().filter(|c| !c.is_control()).take(32).collect();
+            let name = d.get("name").and_then(Value::as_str).unwrap_or("Phone").chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
             list.push(Device { id: id.to_string(), name, added: d.get("added").and_then(Value::as_u64).unwrap_or(0), hash });
         }
         Devices { list }
@@ -240,6 +255,29 @@ mod tests {
         assert_eq!(d.verify(&token(1)), None, "forgotten: the token stops working");
         assert!(!d.forget(&id));
         assert_eq!(d.add(&token(9), 3000).unwrap().name, "Phone 3", "a name is not reused while a higher one exists");
+    }
+
+    #[test]
+    fn a_phone_can_be_renamed_and_the_name_is_cleaned() {
+        let mut d = Devices::default();
+        let id = d.add(&token(1), 5).unwrap().id.clone();
+        d.add(&token(2), 5).unwrap();
+        assert_eq!(d.rename(&id, "  Pixel 8  "), Some("Pixel 8".to_string()));
+        assert_eq!(d.list()[0].name, "Pixel 8");
+        assert_eq!(d.rename(&id, "My\u{7} \nphone"), Some("My phone".to_string()), "control characters go");
+        assert_eq!(d.rename(&id, &"x".repeat(80)).unwrap().chars().count(), MAX_NAME);
+        assert_eq!(d.rename(&id, "   "), None, "nothing left of it");
+        assert_eq!(d.rename(&id, "\u{7}\u{0}"), None);
+        assert_eq!(d.list()[0].name.chars().count(), MAX_NAME, "a refused name changes nothing");
+        assert_eq!(d.rename("nobody", "Name"), None);
+        assert_eq!(d.list()[1].name, "Phone 2", "the other phone is not touched");
+        // kept in the file
+        let back = Devices::parse(&d.serialize());
+        assert_eq!(back.list()[0].name, d.list()[0].name);
+        // the token still works
+        assert!(d.verify(&token(1)).is_some());
+        // a new phone does not take the number of a renamed one wrongly
+        assert_eq!(d.add(&token(3), 6).unwrap().name, "Phone 3");
     }
 
     #[test]

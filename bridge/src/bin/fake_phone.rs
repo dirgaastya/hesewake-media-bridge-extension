@@ -7,6 +7,7 @@
 //!   fake-phone --forget             throw the stored token away
 
 use hesewake_media_bridge::wire::{self, FrameBuf};
+use image::codecs::jpeg::JpegEncoder;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -37,6 +38,21 @@ impl ServerCertVerifier for AnyCert {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
     }
+}
+
+/// A made-up cover: 512 px, a different gradient for each song, as the phone's JPEG (q75) in standard base64.
+fn cover(song: usize) -> String {
+    let img = image::RgbImage::from_fn(512, 512, |x, y| {
+        let (a, b) = ((x * 255 / 511) as u8, (y * 255 / 511) as u8);
+        match song % 3 {
+            0 => image::Rgb([a, b, 160]),
+            1 => image::Rgb([220 - b / 2, a, b]),
+            _ => image::Rgb([b, 200 - a / 2, a]),
+        }
+    });
+    let mut out = Vec::new();
+    JpegEncoder::new_with_quality(&mut out, 75).encode_image(&img).expect("a JPEG");
+    wire::b64std_encode(&out)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -179,6 +195,7 @@ fn main() {
     // play made-up songs: a snapshot every second, commands from the PC
     let (mut song, mut pos, mut playing, mut seq) = (0usize, 0u64, true, 1u64);
     let mut last = Instant::now();
+    let covers: Vec<String> = (0..SONGS.len()).map(cover).collect();
     println!("playing {:?}; Ctrl+C to stop", SONGS[song].0);
     loop {
         if let Some(m) = c.recv() {
@@ -212,6 +229,7 @@ fn main() {
             c.send(
                 "snapshot",
                 json!({"seq": seq, "active": true, "source": "com.example.fakeplayer", "title": title, "artist": artist, "album": album,
+                    "artwork_mime": "image/jpeg", "artwork_base64": covers[song],
                     "position_ms": pos, "duration_ms": dur, "playing": playing, "speed": 1, "actions": ["play", "pause", "next", "previous", "seek"]}),
             );
             seq += 1;

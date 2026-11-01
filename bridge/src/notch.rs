@@ -27,6 +27,8 @@ pub enum FromNotch {
     Back,
     /// The user pressed Settings for this extension.
     Config,
+    /// The user confirmed the text of a page's text box: its id and the text.
+    Input(String, String),
     Lang(String),
     /// Exit: the notch is closing or the extension was switched off. Also what a closed pipe turns into.
     Quit,
@@ -42,6 +44,7 @@ pub fn parse(v: &Value) -> Option<FromNotch> {
         "step" => FromNotch::Step(v.get("dir").and_then(Value::as_i64)?.signum() as i32),
         "back" => FromNotch::Back,
         "config" => FromNotch::Config,
+        "input" => FromNotch::Input(id()?, v.get("value")?.as_str()?.to_string()),
         "lang" => FromNotch::Lang(v.get("lang")?.as_str()?.to_string()),
         "quit" => FromNotch::Quit,
         _ => return None,
@@ -250,6 +253,8 @@ mod tests {
         assert_eq!(p(json!({"t": "step", "dir": -1})), Some(FromNotch::Step(-1)));
         assert_eq!(p(json!({"t": "back"})), Some(FromNotch::Back));
         assert_eq!(p(json!({"t": "config"})), Some(FromNotch::Config));
+        assert_eq!(p(json!({"t": "input", "id": "rename", "value": "Pixel 8"})), Some(FromNotch::Input("rename".into(), "Pixel 8".into())));
+        assert_eq!(p(json!({"t": "input", "id": "rename"})), None, "no text, no message");
         assert_eq!(p(json!({"t": "lang", "lang": "id"})), Some(FromNotch::Lang("id".into())));
         assert_eq!(p(json!({"t": "quit"})), Some(FromNotch::Quit));
         assert_eq!(p(json!({"t": "from-the-future"})), None, "newer messages are ignored");

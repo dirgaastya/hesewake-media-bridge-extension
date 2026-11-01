@@ -9,7 +9,8 @@ use hesewake_media_bridge::media::{Playing, State};
 use hesewake_media_bridge::notch::{FromNotch, Link};
 use hesewake_media_bridge::server::{Event, Server, Timing};
 use hesewake_media_bridge::smtc::{self, Control, Publisher, View};
-use hesewake_media_bridge::ui::{Do, Ui};
+use hesewake_media_bridge::thumb::Thumbs;
+use hesewake_media_bridge::ui::{Do, Hero, Ui};
 use hesewake_media_bridge::wire::{b64std_decode, Action};
 use serde_json::json;
 use std::sync::mpsc::{channel, Sender};
@@ -100,9 +101,12 @@ fn main() {
     ui.set_devices(server.devices());
     // the QR code of the invitation: where this PC is, and the fingerprint the phone pins
     let invite_code = |server: &Server| invite::lan_address().and_then(|ip| invite::matrix(&invite::payload(&ip.to_string(), server.port(), &identity.fingerprint)));
-    let (mut visible, mut last_title) = (false, None::<(String, String)>);
+    let mut visible = false;
     // how long a snapshot takes to get here, from the pings; the song's position is moved on by it
     let mut one_way = Duration::ZERO;
+    // the song's picture for the page, made once per picture; and what the page last said about the song
+    let mut thumbs = Thumbs::default();
+    let mut last_hero = None::<(String, String, bool, bool)>;
     let page = |ui: &mut Ui| link.send(&ui.page());
     let status = |ui: &Ui| link.send(&json!({"t": "status", "text": ui.status()}));
     let toast = |title: &str, sub: &str| link.send(&json!({"t": "toast", "title": title, "sub": sub}));
@@ -148,11 +152,24 @@ fn main() {
                         server.forget(&id);
                         ui.set_devices(server.devices());
                     }
+                    Some(Do::Rename(id, name)) => {
+                        server.rename(&id, &name);
+                        ui.set_devices(server.devices());
+                    }
                     None => {}
                 }
                 ui.set_pairing_left(server.pairing_left());
                 page(&mut ui);
                 status(&ui);
+            }
+            Msg::Notch(FromNotch::Input(id, value)) => {
+                // a name typed in the box of a phone's page: the page comes back with the name it was given
+                if let Some(Do::Rename(phone, name)) = ui.input(&id, &value) {
+                    server.rename(&phone, &name);
+                    ui.set_devices(server.devices());
+                    page(&mut ui);
+                    status(&ui);
+                }
             }
             // its settings are in the panel of the Settings window, not in a window of its own
             Msg::Notch(_) => {}
@@ -186,7 +203,9 @@ fn main() {
                     one_way = Duration::ZERO;
                     ui.set_connected(None);
                     ui.set_playing(None);
-                    last_title = None;
+                    ui.set_hero(None);
+                    thumbs.clear();
+                    last_hero = None;
                     if let Some(p) = &publisher {
                         p.hide();
                     }
@@ -201,7 +220,9 @@ fn main() {
                         p.hide();
                     }
                     ui.set_playing(None);
-                    last_title = None;
+                    ui.set_hero(None);
+                    thumbs.clear();
+                    last_hero = None;
                     page(&mut ui);
                     status(&ui);
                 }
@@ -210,10 +231,15 @@ fn main() {
                         pb.show(view_of(&p, now));
                     }
                     let now_playing = (p.title.clone(), p.artist.clone());
-                    // the notch's page and status change with the song, not with every second of it
-                    if last_title.as_ref() != Some(&now_playing) {
-                        ui.set_playing(Some(now_playing.clone()));
-                        last_title = Some(now_playing);
+                    let image = thumbs.get(s.artwork_base64.as_deref());
+                    let sig = (p.title.clone(), p.artist.clone(), p.playing, image.is_some());
+                    // the notch's page and status change with the song, with play and pause and with the picture that
+                    // arrives for it, not with every second of it
+                    if last_hero.as_ref() != Some(&sig) {
+                        let sub = [p.artist.as_str(), p.album.as_str()].iter().filter(|x| !x.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ");
+                        ui.set_hero(Some(Hero { title: p.title.clone(), sub, image, playing: p.playing }));
+                        last_hero = Some(sig);
+                        ui.set_playing(Some(now_playing));
                         page(&mut ui);
                         status(&ui);
                     }

@@ -170,6 +170,15 @@ impl Server {
         self.inner.active.lock().ok().and_then(|a| a.as_ref().map(|a| a.id.clone()))
     }
 
+    /// A new name for a phone. The name it was given (cleaned), or None if there is no such phone or no name.
+    pub fn rename(&self, id: &str, name: &str) -> Option<String> {
+        let done = self.inner.devices.lock().ok().and_then(|mut d| d.rename(id, name));
+        if done.is_some() {
+            self.inner.save_devices();
+        }
+        done
+    }
+
     /// "Forget this phone": its token stops working and it is disconnected.
     pub fn forget(&self, id: &str) -> bool {
         let found = self.inner.devices.lock().map(|mut d| d.forget(id)).unwrap_or(false);

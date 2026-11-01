@@ -13,6 +13,8 @@ pub enum Do {
     ClosePairing,
     Decide(bool),
     Forget(String),
+    /// A new name for a phone: its id and what the user typed.
+    Rename(String, String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,8 +23,18 @@ enum View {
     Device(String),
 }
 
+/// The song for the card at the top of the page: its words, the picture (a small JPEG as standard base64) and whether it plays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hero {
+    pub title: String,
+    pub sub: String,
+    pub image: Option<String>,
+    pub playing: bool,
+}
+
 pub struct Ui {
     rev: u64,
+    hero: Option<Hero>,
     devices: Vec<Device>,
     connected: Option<String>,
     playing: Option<(String, String)>,
@@ -55,7 +67,7 @@ fn date(unix: u64) -> String {
 
 impl Default for Ui {
     fn default() -> Ui {
-        Ui { rev: 0, devices: Vec::new(), connected: None, playing: None, pairing_left: None, request: None, computer: String::new(), invite: None, view: View::Home }
+        Ui { rev: 0, hero: None, devices: Vec::new(), connected: None, playing: None, pairing_left: None, request: None, computer: String::new(), invite: None, view: View::Home }
     }
 }
 
@@ -75,6 +87,10 @@ impl Ui {
 
     pub fn set_playing(&mut self, now: Option<(String, String)>) {
         self.playing = now;
+    }
+
+    pub fn set_hero(&mut self, hero: Option<Hero>) {
+        self.hero = hero;
     }
 
     /// How long "Pair a phone" has left. When it has run out the code goes too.
@@ -159,6 +175,7 @@ impl Ui {
                     "t": "detail", "rev": rev, "for": id, "title": short(&d.name, 60),
                     "meta": [{"k": "Status", "v": if on { "Connected" } else { "Offline" }}, {"k": "Paired", "v": date(d.added)}],
                     "body": "Forget this phone to take away its access. It has to pair again to come back.",
+                    "input": {"id": "rename", "label": "Name", "value": d.name, "max": crate::pairing::MAX_NAME, "button": "Save"},
                     "buttons": [{"id": format!("forget:{id}"), "label": "Forget"}]
                 });
             }
@@ -166,14 +183,22 @@ impl Ui {
         let rows: Vec<Value> = self
             .devices
             .iter()
-            .map(|d| json!({"id": d.id, "text": short(&d.name, 60), "sub": if self.connected.as_deref() == Some(d.id.as_str()) { "Connected" } else { "Offline" }}))
+            .map(|d| {
+                let on = self.connected.as_deref() == Some(d.id.as_str());
+                json!({"id": d.id, "text": short(&d.name, 60), "sub": if on { "Connected" } else { "Offline" }, "tone": if on { "good" } else { "muted" }})
+            })
             .collect();
-        let foot = match &self.playing {
-            Some((t, a)) => short(&format!("{t} \u{b7} {a}"), 100),
-            None => String::new(),
-        };
         let action = json!({"id": "pair", "label": "Pair a phone"});
-        let mut page = json!({"t": "slide", "rev": rev, "title": "Pho|ne", "actions": [action], "rows": rows, "foot": foot});
+        let mut page = json!({"t": "slide", "rev": rev, "title": "Pho|ne", "actions": [action], "rows": rows});
+        // the song that plays, as a card with its picture at the top
+        if let (Some(h), Some(on)) = (&self.hero, self.connected.as_deref()) {
+            let phone = self.name_of(on);
+            let mut hero = json!({"title": short(&h.title, 80), "sub": short(&h.sub, 80), "text": format!("{phone} \u{b7} {}", if h.playing { "Playing" } else { "Paused" })});
+            if let Some(img) = &h.image {
+                hero["image"] = json!({"mime": "image/jpeg", "data": img});
+            }
+            page["hero"] = hero;
+        }
         if self.devices.is_empty() {
             page["state"] = json!("empty");
             page["message"] = json!("No phone is paired yet. Press Pair a phone.");
@@ -192,6 +217,14 @@ impl Ui {
 
     pub fn back(&mut self) {
         self.view = View::Home;
+    }
+
+    /// The user confirmed the text of a page's text box. Only the phone's name can be typed.
+    pub fn input(&mut self, id: &str, value: &str) -> Option<Do> {
+        match (&self.view, id) {
+            (View::Device(dev), "rename") => Some(Do::Rename(dev.clone(), value.to_string())),
+            _ => None,
+        }
     }
 
     /// A button was clicked.
@@ -264,12 +297,23 @@ mod tests {
         ui.set_devices(d);
         ui.set_connected(Some(b.clone()));
         ui.set_playing(Some(("A Song".into(), "An Artist".into())));
+        ui.set_hero(Some(Hero { title: "A Song".into(), sub: "An Artist".into(), image: Some("AAAA".into()), playing: true }));
         let p = ui.page();
         assert!(p.get("state").is_none(), "rows, not an empty page");
         let rows = p["rows"].as_array().unwrap();
         assert_eq!((rows[0]["id"].as_str(), rows[0]["sub"].as_str()), (Some(a.as_str()), Some("Offline")));
-        assert_eq!((rows[1]["text"].as_str(), rows[1]["sub"].as_str()), (Some("Phone 2"), Some("Connected")));
-        assert_eq!(p["foot"], "A Song \u{b7} An Artist");
+        assert_eq!((rows[1]["text"].as_str(), rows[1]["sub"].as_str(), rows[1]["tone"].as_str()), (Some("Phone 2"), Some("Connected"), Some("good")));
+        assert_eq!(rows[0]["tone"], "muted", "offline is quiet");
+        // the card at the top: the song, which phone, and the picture
+        assert_eq!((p["hero"]["title"].as_str(), p["hero"]["sub"].as_str(), p["hero"]["text"].as_str()), (Some("A Song"), Some("An Artist"), Some("Phone 2 \u{b7} Playing")));
+        assert_eq!((p["hero"]["image"]["mime"].as_str(), p["hero"]["image"]["data"].as_str()), (Some("image/jpeg"), Some("AAAA")));
+        ui.set_hero(Some(Hero { title: "A Song".into(), sub: "An Artist".into(), image: None, playing: false }));
+        let p = ui.page();
+        assert_eq!(p["hero"]["text"], "Phone 2 \u{b7} Paused");
+        assert!(p["hero"].get("image").is_none(), "no picture, no image");
+        ui.set_hero(None);
+        assert!(ui.page().get("hero").is_none());
+        ui.set_hero(Some(Hero { title: "A Song".into(), sub: String::new(), image: None, playing: true }));
         assert_eq!(ui.status(), "Phone 2: A Song");
         ui.set_playing(None);
         assert_eq!(ui.status(), "Phone 2 connected");
@@ -317,6 +361,29 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_is_renamed_from_its_page() {
+        let mut ui = Ui::default();
+        let d = phones(2);
+        let id = d[1].id.clone();
+        ui.set_devices(d);
+        assert_eq!(ui.input("rename", "Pixel 8"), None, "only on a phone's page");
+        assert!(ui.row(&id));
+        let p = ui.page();
+        let inp = &p["input"];
+        assert_eq!((inp["id"].as_str(), inp["value"].as_str(), inp["max"].as_u64(), inp["button"].as_str()), (Some("rename"), Some("Phone 2"), Some(32), Some("Save")));
+        assert_eq!(ui.input("rename", "Pixel 8"), Some(Do::Rename(id.clone(), "Pixel 8".into())));
+        assert_eq!(ui.input("something-else", "x"), None);
+        // the name it was given shows in the page and the list
+        let mut dv = Devices::default();
+        dv.add(&[1; 32], 1_793_491_200);
+        dv.add(&[2; 32], 1_793_577_600);
+        assert_eq!(dv.rename(&id, "Pixel 8"), Some("Pixel 8".to_string()));
+        ui.set_devices(dv.list().to_vec());
+        assert_eq!(ui.page()["title"], "Pixel 8");
+        assert_eq!(ui.page()["input"]["value"], "Pixel 8");
+    }
+
+    #[test]
     fn pairing_buttons_and_revisions() {
         let mut ui = Ui::default();
         assert_eq!(ui.action("pair"), Some(Do::OpenPairing));
@@ -334,6 +401,8 @@ mod tests {
         ui.set_connected(Some(ui.devices[0].id.clone()));
         ui.set_playing(Some(("T".repeat(200), "A".into())));
         assert!(ui.status().chars().count() <= 60);
-        assert!(ui.page()["foot"].as_str().unwrap().chars().count() <= 100);
+        ui.set_hero(Some(Hero { title: "T".repeat(200), sub: "S".repeat(200), image: None, playing: true }));
+        let p = ui.page();
+        assert!(p["hero"]["title"].as_str().unwrap().chars().count() <= 80 && p["hero"]["sub"].as_str().unwrap().chars().count() <= 80, "the card's lines are cut");
     }
 }

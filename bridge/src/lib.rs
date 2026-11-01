@@ -10,6 +10,7 @@ pub mod notch;
 pub mod pairing;
 pub mod server;
 pub mod smtc;
+pub mod thumb;
 pub mod tls;
 pub mod ui;
 pub mod wire;
