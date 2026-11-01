@@ -151,12 +151,23 @@ pub fn pair_decision(approved: bool) -> Vec<u8> {
     frame("pair_decision", json!({"approved": approved})).unwrap_or_default()
 }
 
+/// What this side does beyond the first version of the protocol. A phone only uses what it is told here, so a thing is
+/// listed only once it is done: `artwork_delta_v1` (a snapshot may say `artwork_same` instead of sending the picture again)
+/// and `forget_v1` (the phone may ask to be forgotten).
+pub const CAPABILITIES: [&str; 2] = ["artwork_delta_v1", "forget_v1"];
+
 pub fn pair_result(token: &[u8; 32]) -> Vec<u8> {
-    frame("pair_result", json!({"approved": true, "token": b64_encode(token)})).unwrap_or_default()
+    frame("pair_result", json!({"approved": true, "token": b64_encode(token), "capabilities": CAPABILITIES})).unwrap_or_default()
 }
 
 pub fn auth_result(approved: bool) -> Vec<u8> {
-    frame("auth_result", json!({"approved": approved})).unwrap_or_default()
+    let fields = if approved { json!({"approved": true, "capabilities": CAPABILITIES}) } else { json!({"approved": false}) };
+    frame("auth_result", fields).unwrap_or_default()
+}
+
+/// The answer to a phone that asked to be forgotten: `approved` only if it really is gone from the list on disk.
+pub fn forget_result(approved: bool) -> Vec<u8> {
+    frame("forget_result", json!({"approved": approved})).unwrap_or_default()
 }
 
 pub fn pong(id: &str) -> Vec<u8> {
@@ -214,6 +225,9 @@ pub struct Snapshot {
     pub artwork_mime: Option<String>,
     /// The artwork as it came (base64), already checked to decode to at most `MAX_ARTWORK` bytes.
     pub artwork_base64: Option<String>,
+    /// "The picture is the one from before" (only a phone that was told `artwork_delta_v1` says so). `ArtworkKeep::resolve`
+    /// turns it back into the picture, so nothing after the server needs to know.
+    pub artwork_same: bool,
     pub position_ms: u64,
     pub duration_ms: Option<u64>,
     pub playing: bool,
@@ -221,11 +235,38 @@ pub struct Snapshot {
     pub actions: Vec<Action>,
 }
 
+/// The picture of the song that plays, kept for one connection: a phone that was told `artwork_delta_v1` sends it once and then
+/// only says it is the same. It never carries over to a song without a picture, to nothing playing, or to the next connection.
+#[derive(Default)]
+pub struct ArtworkKeep {
+    last: Option<(String, String)>,
+}
+
+impl ArtworkKeep {
+    /// Make the snapshot hold the picture it means, and take the flag off it.
+    pub fn resolve(&mut self, s: &mut Snapshot) {
+        if !s.active {
+            self.last = None;
+            (s.artwork_mime, s.artwork_base64) = (None, None);
+        } else if let (Some(m), Some(b)) = (&s.artwork_mime, &s.artwork_base64) {
+            self.last = Some((m.clone(), b.clone()));
+        } else if s.artwork_same {
+            (s.artwork_mime, s.artwork_base64) = self.last.clone().unzip();
+        } else {
+            self.last = None;
+            (s.artwork_mime, s.artwork_base64) = (None, None);
+        }
+        s.artwork_same = false;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FromPhone {
-    PairHello { client_nonce: [u8; 32] },
+    PairHello { client_nonce: [u8; 32], device_name: Option<String> },
     PairDecision { approved: bool },
-    Auth { token: [u8; 32] },
+    Auth { token: [u8; 32], device_name: Option<String> },
+    /// "Forget me": the phone asks to have its access taken away.
+    Forget,
     Snapshot(Snapshot),
     Ack { id: String, accepted: bool, reason: String },
     Ping { id: String },
@@ -275,6 +316,11 @@ fn parse_snapshot(v: &Value) -> Result<Snapshot, WireError> {
         Some(Value::String(s)) if s == "image/png" || s == "image/jpeg" => Some(s.clone()),
         Some(_) => return Err(WireError::Field("artwork_mime")),
     };
+    let artwork_same = match v.get("artwork_same") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(WireError::Field("artwork_same")),
+    };
     let speed = match v.get("speed") {
         None | Some(Value::Null) => 1.0,
         Some(x) => x.as_f64().filter(|s| (0.0..=4.0).contains(s)).ok_or(WireError::Field("speed"))?,
@@ -293,6 +339,7 @@ fn parse_snapshot(v: &Value) -> Result<Snapshot, WireError> {
         album: text(v, "album")?,
         artwork_mime,
         artwork_base64,
+        artwork_same,
         position_ms: uint("position_ms")?.unwrap_or(0),
         duration_ms: uint("duration_ms")?,
         playing: v.get("playing").and_then(Value::as_bool).unwrap_or(false),
@@ -308,10 +355,13 @@ pub fn parse(payload: &[u8]) -> Result<FromPhone, WireError> {
         return Err(WireError::Version);
     }
     let id = || v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string).ok_or(WireError::Field("id"));
+    // the name a phone gives itself is optional and only text; anything else is as good as none
+    let device_name = || v.get("device_name").and_then(Value::as_str).filter(|s| s.len() <= MAX_TEXT).map(str::to_string);
     match v.get("type").and_then(Value::as_str).ok_or(WireError::Type)? {
-        "pair_hello" => Ok(FromPhone::PairHello { client_nonce: nonce(&v, "client_nonce")? }),
+        "pair_hello" => Ok(FromPhone::PairHello { client_nonce: nonce(&v, "client_nonce")?, device_name: device_name() }),
         "pair_decision" => Ok(FromPhone::PairDecision { approved: v.get("approved").and_then(Value::as_bool).ok_or(WireError::Field("approved"))? }),
-        "auth" => Ok(FromPhone::Auth { token: nonce(&v, "token")? }),
+        "auth" => Ok(FromPhone::Auth { token: nonce(&v, "token")?, device_name: device_name() }),
+        "forget" => Ok(FromPhone::Forget),
         "snapshot" => Ok(FromPhone::Snapshot(parse_snapshot(&v)?)),
         "ack" => Ok(FromPhone::Ack {
             id: id()?,
@@ -412,11 +462,11 @@ mod tests {
     fn pairing_and_auth_messages() {
         let n = [7u8; 32];
         let hello = frame("pair_hello", json!({"client_nonce": b64_encode(&n)})).unwrap();
-        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n }));
+        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n, device_name: None }));
         let hello_short = frame("pair_hello", json!({"client_nonce": b64_encode(&n[..31])})).unwrap();
         assert_eq!(parse(&hello_short[4..]), Err(WireError::Field("client_nonce")), "32 bytes exactly");
         let auth = frame("auth", json!({"token": b64_encode(&n)})).unwrap();
-        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n }));
+        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n, device_name: None }));
         let d = frame("pair_decision", json!({"approved": true})).unwrap();
         assert_eq!(parse(&d[4..]), Ok(FromPhone::PairDecision { approved: true }));
         assert_eq!(parse(&frame("pair_decision", json!({"approved": "yes"})).unwrap()[4..]), Err(WireError::Field("approved")));
@@ -512,5 +562,87 @@ mod tests {
         assert!(!same_bytes(&[1, 2, 3], &[1, 2, 4]));
         assert!(!same_bytes(&[1, 2, 3], &[1, 2]));
         assert!(same_bytes(&[], &[]));
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    fn snap(extra: Value) -> Snapshot {
+        let mut v = json!({"seq": 1, "active": true, "title": "T"});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        parse_snapshot(&v).unwrap()
+    }
+
+    #[test]
+    fn the_results_say_what_this_side_can_do() {
+        let r: Value = serde_json::from_slice(&auth_result(true)[4..]).unwrap();
+        assert_eq!(r["capabilities"], json!(["artwork_delta_v1", "forget_v1"]));
+        let r: Value = serde_json::from_slice(&auth_result(false)[4..]).unwrap();
+        assert_eq!(r, json!({"v": 1, "type": "auth_result", "approved": false}), "a phone that is turned away is told nothing more");
+        let r: Value = serde_json::from_slice(&forget_result(true)[4..]).unwrap();
+        assert_eq!(r, json!({"v": 1, "type": "forget_result", "approved": true}));
+    }
+
+    #[test]
+    fn a_phone_may_give_its_name_and_ask_to_be_forgotten() {
+        let n = [5u8; 32];
+        let hello = frame("pair_hello", json!({"client_nonce": b64_encode(&n), "device_name": "Pixel 9"})).unwrap();
+        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n, device_name: Some("Pixel 9".into()) }));
+        let auth = frame("auth", json!({"token": b64_encode(&n), "device_name": 7})).unwrap();
+        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n, device_name: None }), "a name that is not text is no name, not an error");
+        let forget = frame("forget", json!({})).unwrap();
+        assert_eq!(parse(&forget[4..]), Ok(FromPhone::Forget));
+    }
+
+    #[test]
+    fn artwork_same_must_be_a_flag() {
+        assert!(!snap(json!({})).artwork_same);
+        assert!(snap(json!({"artwork_same": true})).artwork_same);
+        assert!(parse_snapshot(&json!({"seq": 1, "active": true, "artwork_same": "yes"})).is_err());
+    }
+
+    fn with_art(mime: &str, b64: &str) -> Snapshot {
+        snap(json!({"artwork_mime": mime, "artwork_base64": b64}))
+    }
+
+    #[test]
+    fn the_last_picture_stands_in_for_the_same_one_and_never_outlives_its_song_or_its_connection() {
+        let mut keep = ArtworkKeep::default();
+        let mut s = with_art("image/png", "AAAA");
+        keep.resolve(&mut s);
+        assert_eq!(s.artwork_base64.as_deref(), Some("AAAA"), "a new picture is passed on and kept");
+
+        let mut s = snap(json!({"artwork_same": true}));
+        keep.resolve(&mut s);
+        assert_eq!((s.artwork_mime.as_deref(), s.artwork_base64.as_deref(), s.artwork_same), (Some("image/png"), Some("AAAA"), false), "the same one is filled in");
+
+        let mut s = with_art("image/jpeg", "BBBB");
+        keep.resolve(&mut s);
+        let mut s2 = snap(json!({"artwork_same": true}));
+        keep.resolve(&mut s2);
+        assert_eq!(s2.artwork_base64.as_deref(), Some("BBBB"), "a changed picture replaces the kept one, whatever the song says");
+
+        let mut none = snap(json!({}));
+        keep.resolve(&mut none);
+        assert_eq!(none.artwork_base64, None, "no picture and no flag: the song has none");
+        let mut again = snap(json!({"artwork_same": true}));
+        keep.resolve(&mut again);
+        assert_eq!(again.artwork_base64, None, "a song without a picture leaves nothing to inherit");
+
+        let mut s = with_art("image/png", "AAAA");
+        keep.resolve(&mut s);
+        let mut idle = snap(json!({"active": false, "artwork_same": true}));
+        keep.resolve(&mut idle);
+        assert_eq!(idle.artwork_base64, None, "nothing plays: the picture goes");
+        let mut after = snap(json!({"artwork_same": true}));
+        keep.resolve(&mut after);
+        assert_eq!(after.artwork_base64, None);
+
+        let mut fresh = ArtworkKeep::default();
+        let mut first = snap(json!({"artwork_same": true}));
+        fresh.resolve(&mut first);
+        assert_eq!(first.artwork_base64, None, "a new connection starts with nothing kept");
     }
 }

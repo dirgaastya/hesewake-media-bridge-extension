@@ -125,6 +125,10 @@ impl Conn {
     }
 }
 
+fn caps_of(v: &Value) -> Vec<String> {
+    v["capabilities"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
+}
+
 fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
 }
@@ -143,6 +147,7 @@ fn main() {
         }),
     };
     let stored: Option<Value> = std::fs::read_to_string(FILE).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let name = arg("--name").unwrap_or_else(|| "Fake Phone".to_string());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().dangerous().with_custom_certificate_verifier(Arc::new(AnyCert)).with_no_client_auth();
     let tcp = TcpStream::connect((host.as_str(), port)).expect("connect");
@@ -154,6 +159,7 @@ fn main() {
     let fingerprint = wire::fingerprint(tls.conn.peer_certificates().expect("a certificate")[0].as_ref());
     let mut c = Conn { tls, fb: FrameBuf::default() };
 
+    let caps: Vec<String>;
     match stored {
         Some(s) if s["fingerprint"].as_str().and_then(unhex).as_deref() != Some(&fingerprint[..]) => {
             println!("the PC's certificate is not the one that was paired with; run with --forget to pair again");
@@ -161,17 +167,18 @@ fn main() {
         }
         Some(s) => {
             let token = s["token"].as_str().unwrap_or("");
-            c.send("auth", json!({"token": token}));
+            c.send("auth", json!({"token": token, "device_name": name}));
             let r = c.wait("auth_result");
             if r["approved"] != true {
                 println!("the PC does not know this phone any more (forgotten?); run with --forget to pair again");
                 std::process::exit(1);
             }
+            caps = caps_of(&r);
             println!("signed in");
         }
         None => {
             let nonce: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(std::process::id() as u8));
-            c.send("pair_hello", json!({"client_nonce": wire::b64_encode(&nonce)}));
+            c.send("pair_hello", json!({"client_nonce": wire::b64_encode(&nonce), "device_name": name}));
             let ch = c.wait("pair_challenge");
             if ch["type"] != "pair_challenge" {
                 println!("the PC will not pair now: press \"Pair a phone\" in the notch first");
@@ -186,14 +193,29 @@ fn main() {
                 std::process::exit(1);
             }
             let res = c.wait("pair_result");
+            caps = caps_of(&res);
             let token = res["token"].as_str().expect("a token").to_string();
             std::fs::write(FILE, json!({"token": token, "fingerprint": hex(&fingerprint)}).to_string()).expect("keep the token");
             println!("paired; token kept in {FILE}");
         }
     }
 
+    println!("the PC offers: {caps:?}");
+    if std::env::args().any(|a| a == "--forget-on-pc") {
+        c.send("forget", json!({}));
+        let r = c.wait("forget_result");
+        println!("forget_result: {r}");
+        if r["approved"] == true {
+            let _ = std::fs::remove_file(FILE);
+        }
+        return;
+    }
+    let delta = caps.iter().any(|x| x == "artwork_delta_v1");
+
     // play made-up songs: a snapshot every second, commands from the PC
     let (mut song, mut pos, mut playing, mut seq) = (0usize, 0u64, true, 1u64);
+    // the song whose cover the PC has on this connection
+    let mut sent_cover: Option<usize> = None;
     let mut last = Instant::now();
     let covers: Vec<String> = (0..SONGS.len()).map(cover).collect();
     println!("playing {:?}; Ctrl+C to stop", SONGS[song].0);
@@ -226,12 +248,16 @@ fn main() {
             }
             last = Instant::now();
             let (title, artist, album, dur) = SONGS[song];
-            c.send(
-                "snapshot",
-                json!({"seq": seq, "active": true, "source": "com.example.fakeplayer", "title": title, "artist": artist, "album": album,
-                    "artwork_mime": "image/jpeg", "artwork_base64": covers[song],
-                    "position_ms": pos, "duration_ms": dur, "playing": playing, "speed": 1, "actions": ["play", "pause", "next", "previous", "seek"]}),
-            );
+            let art = if delta && sent_cover == Some(song) {
+                json!({"artwork_same": true})
+            } else {
+                sent_cover = Some(song);
+                json!({"artwork_mime": "image/jpeg", "artwork_base64": covers[song]})
+            };
+            let mut snap = json!({"seq": seq, "active": true, "source": "com.example.fakeplayer", "title": title, "artist": artist, "album": album,
+                    "position_ms": pos, "duration_ms": dur, "playing": playing, "speed": 1, "actions": ["play", "pause", "next", "previous", "seek"]});
+            snap.as_object_mut().unwrap().extend(art.as_object().unwrap().clone());
+            c.send("snapshot", snap);
             seq += 1;
         }
     }

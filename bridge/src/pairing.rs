@@ -99,7 +99,18 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[derive(Default, Debug, PartialEq)]
+/// A name as it is kept: control characters dropped, the ends trimmed, at most `MAX_NAME` characters.
+fn clean_name(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(MAX_NAME).collect();
+    clean.trim().to_string()
+}
+
+/// "Phone 3": the name a phone gets when it did not give one, which the user has not changed.
+fn is_numbered(name: &str) -> bool {
+    name.strip_prefix("Phone ").is_some_and(|n| n.parse::<u32>().is_ok())
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Devices {
     list: Vec<Device>,
 }
@@ -123,6 +134,11 @@ impl Devices {
 
     /// Remember a phone that was just paired. None if there is no room.
     pub fn add(&mut self, token: &[u8; 32], now_unix: u64) -> Option<&Device> {
+        self.add_named(token, now_unix, None)
+    }
+
+    /// Like `add`, with the name the phone gave itself (cleaned; a number if it gave none or nothing is left of it).
+    pub fn add_named(&mut self, token: &[u8; 32], now_unix: u64, name: Option<&str>) -> Option<&Device> {
         if self.list.len() >= MAX_DEVICES {
             return None;
         }
@@ -131,7 +147,7 @@ impl Devices {
         while self.list.iter().any(|d| d.id == id) {
             id.push('x');
         }
-        let name = format!("Phone {}", self.list.iter().filter_map(|d| d.name.strip_prefix("Phone ")?.parse::<u32>().ok()).max().unwrap_or(0) + 1);
+        let name = name.map(clean_name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Phone {}", self.list.iter().filter_map(|d| d.name.strip_prefix("Phone ")?.parse::<u32>().ok()).max().unwrap_or(0) + 1));
         self.list.push(Device { id, name, added: now_unix, hash });
         self.list.last()
     }
@@ -139,12 +155,26 @@ impl Devices {
     /// A new name for a phone: control characters dropped, the ends trimmed, at most `MAX_NAME` characters. The cleaned name
     /// if it was taken (it is never empty), None if there is no such phone or nothing is left of the name.
     pub fn rename(&mut self, id: &str, name: &str) -> Option<String> {
-        let clean: String = name.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(MAX_NAME).collect();
-        let clean = clean.trim().to_string();
+        let clean = clean_name(name);
         if clean.is_empty() {
             return None;
         }
         let d = self.list.iter_mut().find(|d| d.id == id)?;
+        d.name = clean.clone();
+        Some(clean)
+    }
+
+    /// The name a phone gives itself when it signs in. It is taken only by a phone that still has a numbered name ("Phone 2"),
+    /// so a name that was given at pairing or typed in is left alone. The new name if it was taken.
+    pub fn adopt_name(&mut self, id: &str, name: &str) -> Option<String> {
+        let clean = clean_name(name);
+        if clean.is_empty() {
+            return None;
+        }
+        let d = self.list.iter_mut().find(|d| d.id == id)?;
+        if !is_numbered(&d.name) || d.name == clean {
+            return None;
+        }
         d.name = clean.clone();
         Some(clean)
     }
@@ -317,5 +347,40 @@ mod tests {
         assert_eq!(d.list()[1].name, "Phone", "a missing name gets a plain one");
         let many: Vec<Value> = (0..20u8).map(|n| json!({"id": format!("d{n}"), "hash": b64_encode(&[n; 32])})).collect();
         assert_eq!(Devices::parse(&json!({"devices": many}).to_string()).list().len(), MAX_DEVICES);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    fn token(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn a_phone_that_gives_its_name_gets_it_and_one_that_does_not_gets_a_number() {
+        let mut d = Devices::default();
+        assert_eq!(d.add_named(&token(1), 0, Some("  Pixel\u{7} 9 ")).unwrap().name, "Pixel 9", "cleaned like a name typed in");
+        assert_eq!(d.add_named(&token(2), 0, Some("   ")).unwrap().name, "Phone 1", "nothing left of it: a number");
+        assert_eq!(d.add_named(&token(3), 0, None).unwrap().name, "Phone 2");
+        let long = "x".repeat(100);
+        assert_eq!(d.add_named(&token(4), 0, Some(&long)).unwrap().name.chars().count(), MAX_NAME);
+    }
+
+    #[test]
+    fn the_name_a_phone_signs_in_with_never_replaces_a_name_that_was_chosen() {
+        let mut d = Devices::default();
+        let old = d.add(&token(1), 0).unwrap().id.clone();
+        let named = d.add_named(&token(2), 0, Some("Pixel 9")).unwrap().id.clone();
+        assert_eq!(d.adopt_name(&old, "Galaxy A57"), Some("Galaxy A57".to_string()), "a phone paired without a name gets the one it has now");
+        assert_eq!(d.adopt_name(&old, "Something else"), None, "but only once: the name it has is its own now");
+        assert_eq!(d.adopt_name(&named, "Other"), None, "the name it paired with stays");
+        d.rename(&old, "Phone 7");
+        assert_eq!(d.adopt_name(&old, "Again"), Some("Again".to_string()), "a name that looks like the numbered one counts as not chosen");
+        assert_eq!(d.adopt_name("nobody", "X"), None);
+        assert_eq!(d.adopt_name(&named, ""), None);
+        d.rename(&named, "My phone");
+        assert_eq!(d.adopt_name(&named, "Pixel 9"), None);
     }
 }

@@ -114,7 +114,7 @@ fn main() {
     let mut live = None::<String>;
     // the song's picture for the page, made once per picture; and what the page last said about the song
     let mut thumbs = Thumbs::default();
-    let mut last_hero = None::<(String, String, bool, bool)>;
+    let mut last_hero = None::<(String, String, bool, Option<String>)>;
     let page = |ui: &mut Ui| link.send(&ui.page());
     let status = |ui: &Ui| link.send(&json!({"t": "status", "text": ui.status()}));
     let toast = |title: &str, sub: &str| link.send(&json!({"t": "toast", "title": title, "sub": sub}));
@@ -210,6 +210,13 @@ fn main() {
                 page(&mut ui);
                 status(&ui);
             }
+            Msg::Server(Event::Forgotten { name, .. }) => {
+                // the phone took itself off the list; the Disconnected that follows clears what it was playing
+                ui.set_devices(server.devices());
+                toast(&format!("{name} removed itself"), "Media Bridge");
+                page(&mut ui);
+                status(&ui);
+            }
             Msg::Server(Event::Disconnected { why, .. }) => {
                 gone_at = Some(Instant::now());
                 log::note(&format!("page told: disconnected ({why})"));
@@ -248,7 +255,7 @@ fn main() {
                     }
                     let now_playing = (p.title.clone(), p.artist.clone());
                     let image = thumbs.get(s.artwork_base64.as_deref());
-                    let sig = (p.title.clone(), p.artist.clone(), p.playing, image.is_some());
+                    let sig = (p.title.clone(), p.artist.clone(), p.playing, image.clone());
                     // the notch's page and status change with the song, with play and pause and with the picture that
                     // arrives for it, not with every second of it
                     if last_hero.as_ref() != Some(&sig) {

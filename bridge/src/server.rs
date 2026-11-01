@@ -32,6 +32,8 @@ pub enum Event {
     /// Why it ended: `closed by the phone`, `bad frame`, `idle`, `write failed`, `seq went back`, `unexpected message` or
     /// `replaced or forgotten`.
     Disconnected { id: String, why: &'static str },
+    /// The phone asked to be forgotten and it was: it is gone from the list and its token is dead.
+    Forgotten { id: String, name: String },
     Snapshot(Snapshot),
     /// How long a message from the phone takes to get here now (one way), as far as the pings can tell.
     Latency(Duration),
@@ -260,13 +262,32 @@ impl Conn {
 }
 
 impl Inner {
-    fn save_devices(&self) {
-        if let (Some(file), Ok(d)) = (&self.devices_file, self.devices.lock()) {
-            if let Some(dir) = file.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(file, d.serialize());
+    /// Write the list down. True if it is kept (also when there is no file to keep it in).
+    fn save_devices(&self) -> bool {
+        let (Some(file), Ok(d)) = (&self.devices_file, self.devices.lock()) else { return self.devices_file.is_none() };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
         }
+        std::fs::write(file, d.serialize()).is_ok()
+    }
+
+    /// Take a phone's access away for good. False, and nothing changed, if there is no such phone or the change cannot be kept.
+    fn revoke(&self, id: &str) -> bool {
+        let backup = {
+            let Ok(mut d) = self.devices.lock() else { return false };
+            let before = d.clone();
+            if !d.forget(id) {
+                return false;
+            }
+            before
+        };
+        if self.save_devices() {
+            return true;
+        }
+        if let Ok(mut d) = self.devices.lock() {
+            *d = backup;
+        }
+        false
     }
 
     fn emit(&self, e: Event) {
@@ -280,8 +301,8 @@ impl Inner {
         let Ok(session) = ServerConnection::new(self.cfg.clone()) else { return };
         let mut c = Conn { tls: StreamOwned::new(session, tcp), fb: FrameBuf::default(), buf: vec![0u8; 16 * 1024] };
         let who = match c.next(Instant::now() + self.timing.hello) {
-            Some(FromPhone::PairHello { client_nonce }) => self.pair(&mut c, &client_nonce),
-            Some(FromPhone::Auth { token }) => self.auth(&mut c, &token),
+            Some(FromPhone::PairHello { client_nonce, device_name }) => self.pair(&mut c, &client_nonce, device_name.as_deref()),
+            Some(FromPhone::Auth { token, device_name }) => self.auth(&mut c, &token, device_name.as_deref()),
             _ => None,
         };
         if let Some(id) = who {
@@ -290,12 +311,12 @@ impl Inner {
     }
 
     /// A phone asks to pair. Some(id) once it is paired (the connection goes on as that phone).
-    fn pair(&self, c: &mut Conn, client_nonce: &[u8; 32]) -> Option<String> {
+    fn pair(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>) -> Option<String> {
         let started = Instant::now();
         if self.gate.lock().ok()?.begin(started).is_err() {
             return None;
         }
-        let paired = self.pair_inner(c, client_nonce, started);
+        let paired = self.pair_inner(c, client_nonce, device_name, started);
         if let Ok(mut g) = self.gate.lock() {
             g.end(paired.is_some(), Instant::now());
         }
@@ -306,7 +327,7 @@ impl Inner {
         paired
     }
 
-    fn pair_inner(&self, c: &mut Conn, client_nonce: &[u8; 32], started: Instant) -> Option<String> {
+    fn pair_inner(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>, started: Instant) -> Option<String> {
         let server_nonce = random::<32>();
         if !c.send(&wire::pair_challenge(&server_nonce)) {
             return None;
@@ -333,7 +354,7 @@ impl Inner {
         let approved = phone == Some(true) && user == Some(true);
         let device = if approved {
             let token = random::<32>();
-            let added = self.devices.lock().ok().and_then(|mut d| d.add(&token, now_unix()).map(|d| d.id.clone()));
+            let added = self.devices.lock().ok().and_then(|mut d| d.add_named(&token, now_unix(), device_name).map(|d| d.id.clone()));
             added.map(|id| (id, token))
         } else {
             None
@@ -347,8 +368,14 @@ impl Inner {
     }
 
     /// A phone that was paired before. Some(id) if its token is good.
-    fn auth(&self, c: &mut Conn, token: &[u8; 32]) -> Option<String> {
+    fn auth(&self, c: &mut Conn, token: &[u8; 32], device_name: Option<&str>) -> Option<String> {
         let id = self.devices.lock().ok()?.verify(token).map(|d| d.id.clone());
+        // a phone that has not been given a name of its own takes the one it brings
+        if let (Some(id), Some(name)) = (&id, device_name) {
+            if self.devices.lock().ok().and_then(|mut d| d.adopt_name(id, name)).is_some() {
+                self.save_devices();
+            }
+        }
         c.send(&wire::auth_result(id.is_some()));
         if id.is_none() {
             // a guess costs time
@@ -374,6 +401,7 @@ impl Inner {
         // a few quick pings first, so the delay is known when the first song arrives; then one now and then
         let (mut latency, mut sent, mut burst) = (Latency::default(), Vec::<(String, Instant)>::new(), 4u32);
         let mut burst_at = Instant::now();
+        let mut keep = wire::ArtworkKeep::default();
         loop {
             if !self.active.lock().is_ok_and(|a| a.as_ref().is_some_and(|a| a.generation == generation)) {
                 why = "replaced or forgotten";
@@ -410,17 +438,29 @@ impl Inner {
                                 }
                             }
                         }
-                        FromPhone::Snapshot(s) => {
+                        FromPhone::Snapshot(mut s) => {
                             // `seq` only goes up: an old or repeated one is a phone that is confused, or something else
                             if last_seq.is_some_and(|l| s.seq <= l) {
                                 why = "seq went back";
                                 break;
                             }
                             last_seq = Some(s.seq);
+                            keep.resolve(&mut s);
                             self.emit(Event::Snapshot(s));
                         }
                         FromPhone::Ack { id, accepted, reason } => self.emit(Event::Ack { id, accepted, reason }),
                         // pairing or signing in again on a signed-in connection
+                        FromPhone::Forget => {
+                            let name = self.devices.lock().ok().and_then(|d| d.list().iter().find(|x| x.id == id).map(|x| x.name.clone())).unwrap_or_default();
+                            let done = self.revoke(&id);
+                            c.send(&wire::forget_result(done));
+                            if done {
+                                crate::log::note(&format!("phone {id} asked to be forgotten"));
+                                self.emit(Event::Forgotten { id: id.clone(), name });
+                                why = "forgotten by the phone";
+                                break;
+                            }
+                        }
                         FromPhone::PairHello { .. } | FromPhone::PairDecision { .. } | FromPhone::Auth { .. } => {
                             why = "unexpected message";
                             break;
@@ -579,12 +619,20 @@ mod tests {
 
     const NONCE: [u8; 32] = [3; 32];
 
-    /// Pair a phone to the end; returns its token and the code both sides saw.
     fn pair(r: &Rig) -> ([u8; 32], String) {
+        pair_as(r, None)
+    }
+
+    /// Pair a phone to the end, with the name it gives (if any); returns its token and the code both sides saw.
+    fn pair_as(r: &Rig, name: Option<&str>) -> ([u8; 32], String) {
         r.server.open_pairing();
         let mut p = Phone::connect(r.server.port());
         assert_eq!(p.fingerprint(), r.fp, "the phone sees the certificate it will pin");
-        p.send("pair_hello", json!({"client_nonce": wire::b64_encode(&NONCE)}));
+        let mut hello = json!({"client_nonce": wire::b64_encode(&NONCE)});
+        if let Some(n) = name {
+            hello["device_name"] = json!(n);
+        }
+        p.send("pair_hello", hello);
         let ch = p.recv().expect("challenge");
         assert_eq!(ch["type"], "pair_challenge");
         let server_nonce = wire::b64_decode(ch["server_nonce"].as_str().unwrap()).unwrap();
@@ -596,6 +644,7 @@ mod tests {
         assert_eq!(p.recv().unwrap()["approved"], true);
         let res = p.recv().unwrap();
         assert_eq!((res["type"].as_str(), res["approved"].as_bool()), (Some("pair_result"), Some(true)));
+        assert_eq!(res["capabilities"], json!(["artwork_delta_v1", "forget_v1"]));
         let token: [u8; 32] = wire::b64_decode(res["token"].as_str().unwrap()).unwrap().try_into().unwrap();
         assert!(matches!(r.event(), Event::PairEnded { paired: true }));
         assert!(matches!(r.event(), Event::Connected { .. }), "after pairing the phone is signed in");
@@ -603,9 +652,17 @@ mod tests {
     }
 
     fn sign_in(r: &Rig, token: &[u8; 32]) -> Phone {
+        sign_in_as(r, token, None)
+    }
+
+    fn sign_in_as(r: &Rig, token: &[u8; 32], name: Option<&str>) -> Phone {
         let mut p = Phone::connect(r.server.port());
-        p.send("auth", json!({"token": wire::b64_encode(token)}));
-        assert_eq!(p.recv().unwrap(), json!({"v": 1, "type": "auth_result", "approved": true}));
+        let mut auth = json!({"token": wire::b64_encode(token)});
+        if let Some(n) = name {
+            auth["device_name"] = json!(n);
+        }
+        p.send("auth", auth);
+        assert_eq!(p.recv().unwrap(), json!({"v": 1, "type": "auth_result", "approved": true, "capabilities": ["artwork_delta_v1", "forget_v1"]}));
         p
     }
 
@@ -633,6 +690,117 @@ mod tests {
         assert_eq!((c["type"].as_str(), c["action"].as_str(), c["position_ms"].as_u64(), c["id"].as_str()), (Some("command"), Some("seek"), Some(30000), Some(id.as_str())));
         p.send("ack", json!({"id": id, "accepted": true}));
         assert_eq!(r.event(), Event::Ack { id, accepted: true, reason: String::new() });
+    }
+
+    /// The next frame that is not a ping (the server pings now and then, on its own).
+    fn reply(p: &mut Phone) -> Value {
+        loop {
+            let v = p.recv().expect("a reply");
+            if v["type"] != "ping" {
+                return v;
+            }
+        }
+    }
+
+    fn drain(r: &Rig) {
+        while r.events.recv_timeout(Duration::from_millis(150)).is_ok() {}
+    }
+
+    #[test]
+    fn a_phone_pairs_with_the_name_it_gives_and_signing_in_keeps_a_chosen_name() {
+        let r = rig(fast(), None);
+        let (token, _) = pair_as(&r, Some("Pixel 9"));
+        assert_eq!(r.server.devices()[0].name, "Pixel 9");
+        let id = r.server.devices()[0].id.clone();
+        let _p = sign_in_as(&r, &token, Some("Pixel 9 Pro"));
+        assert_eq!(r.server.devices()[0].name, "Pixel 9", "the name from pairing stays");
+        r.server.rename(&id, "Dirga's phone");
+        let _q = sign_in_as(&r, &token, Some("Pixel 9"));
+        assert_eq!(r.server.devices()[0].name, "Dirga's phone", "a name typed in stays");
+
+        // a phone paired before it gave names takes the one it has when it signs in
+        let r = rig(fast(), None);
+        let (token, _) = pair(&r);
+        assert_eq!(r.server.devices()[0].name, "Phone 1");
+        let _p = sign_in_as(&r, &token, Some("Galaxy A57"));
+        assert_eq!(r.server.devices()[0].name, "Galaxy A57");
+    }
+
+    #[test]
+    fn a_picture_that_is_said_to_be_the_same_is_the_one_from_before_on_this_connection_only() {
+        let r = rig(fast(), None);
+        let (token, _) = pair(&r);
+        let mut p = sign_in(&r, &token);
+        drain(&r);
+        let send = |p: &mut Phone, seq: u64, extra: Value| {
+            let mut s = snapshot(seq);
+            s.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            p.send("snapshot", s);
+        };
+        let art = |r: &Rig| {
+            let Event::Snapshot(s) = r.event() else { panic!("a snapshot") };
+            (s.artwork_mime, s.artwork_base64)
+        };
+        send(&mut p, 1, json!({"artwork_mime": "image/png", "artwork_base64": "AAAA"}));
+        assert_eq!(art(&r), (Some("image/png".to_string()), Some("AAAA".to_string())));
+        send(&mut p, 2, json!({"artwork_same": true}));
+        assert_eq!(art(&r), (Some("image/png".to_string()), Some("AAAA".to_string())), "the same picture comes back");
+        send(&mut p, 3, json!({"artwork_mime": "image/jpeg", "artwork_base64": "BBBB"}));
+        assert_eq!(art(&r).1.as_deref(), Some("BBBB"), "another picture for the same title is another picture");
+        send(&mut p, 4, json!({}));
+        assert_eq!(art(&r), (None, None), "no picture, no flag: none, and nothing is inherited");
+        send(&mut p, 5, json!({"artwork_same": true}));
+        assert_eq!(art(&r), (None, None));
+        send(&mut p, 6, json!({"artwork_mime": "image/png", "artwork_base64": "AAAA"}));
+        art(&r);
+        let mut q = sign_in(&r, &token);
+        drain(&r);
+        send(&mut q, 1, json!({"artwork_same": true}));
+        assert_eq!(art(&r), (None, None), "a new connection does not inherit the picture of the old one");
+    }
+
+    #[test]
+    fn a_phone_that_asks_to_be_forgotten_is_forgotten_and_told_so() {
+        let dir = std::env::temp_dir().join(format!("hesewake-bridge-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("devices.json");
+        let r = rig(fast(), Some(file.clone()));
+        let (token, _) = pair(&r);
+        let other = {
+            let mut d = r.server.devices();
+            assert_eq!(d.len(), 1);
+            d.remove(0).id
+        };
+        let mut p = sign_in(&r, &token);
+        drain(&r);
+        p.send("forget", json!({}));
+        assert_eq!(reply(&mut p), json!({"v": 1, "type": "forget_result", "approved": true}));
+        assert!(matches!(r.event(), Event::Forgotten { ref id, .. } if *id == other));
+        assert!(matches!(r.event(), Event::Disconnected { .. }));
+        assert!(r.server.devices().is_empty());
+        assert!(!std::fs::read_to_string(&file).unwrap().contains(&other), "gone from the file as well");
+        let mut again = Phone::connect(r.server.port());
+        again.send("auth", json!({"token": wire::b64_encode(&token)}));
+        assert_eq!(again.recv().unwrap()["approved"], false, "the old token is turned away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forget_that_cannot_be_kept_is_refused_and_nothing_is_lost() {
+        let dir = std::env::temp_dir().join(format!("hesewake-bridge-forget-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-folder");
+        std::fs::write(&blocker, "x").unwrap();
+        // a file where the folder should be: nothing can be saved there
+        let r = rig(fast(), Some(blocker.join("devices.json")));
+        let (token, _) = pair(&r);
+        let mut p = sign_in(&r, &token);
+        drain(&r);
+        p.send("forget", json!({}));
+        assert_eq!(reply(&mut p), json!({"v": 1, "type": "forget_result", "approved": false}));
+        assert_eq!(r.server.devices().len(), 1, "it is still paired, since the change could not be made lasting");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

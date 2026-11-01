@@ -88,6 +88,7 @@ mod tests {
             album: "An Album".into(),
             artwork_mime: None,
             artwork_base64: None,
+            artwork_same: false,
             position_ms,
             duration_ms,
             playing,
