@@ -1,0 +1,8 @@
+Hesewake Media Bridge shows what plays on your Android phone in Hesewake Notch (0.13.0 or newer).
+
+After the install:
+  1. In the notch open Settings > Extensions, press Rescan, and turn Media Bridge on.
+  2. If Windows asks about the network, allow it for PRIVATE networks only.
+  3. Press Settings on the Media Bridge card, then Pair a phone.
+
+This installer needs no administrator rights.

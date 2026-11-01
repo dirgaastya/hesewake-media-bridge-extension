@@ -1,0 +1,63 @@
+name: Release
+
+# Pushing a version tag (e.g. v0.1.0) builds the program and the installer, then creates a draft GitHub Release.
+# Review the draft and publish it by hand.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Tag must match the version in bridge/Cargo.toml
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path bridge/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$ver" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match the Cargo.toml version ($ver)" }
+          "VERSION=$ver" >> $env:GITHUB_ENV
+
+      - name: Install Inno Setup if missing
+        shell: pwsh
+        run: |
+          $found = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ }
+          if (-not $found) { choco install innosetup -y --no-progress }
+
+      - name: Test
+        shell: pwsh
+        working-directory: bridge
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static -D warnings
+        run: cargo test --locked --lib
+
+      - name: Build program + installer
+        shell: pwsh
+        run: ./scripts/build-installer.ps1
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($env:VERSION))\]" | Select-Object -First 1).LineNumber
+          if (-not $start) { "See CHANGELOG.md." | Set-Content notes.md; exit 0 }
+          $rest = $lines[$start..($lines.Count - 1)]
+          $end = ($rest | Select-String -Pattern '^## \[' | Select-Object -First 1).LineNumber
+          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
+          $body | Set-Content notes.md
+
+      - name: Draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $setup = "installer_output\HesewakeMediaBridge-Setup-$env:VERSION.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLower()
+          "$hash  HesewakeMediaBridge-Setup-$env:VERSION.exe" | Set-Content -Encoding ascii SHA256SUMS
+          gh release create "${{ github.ref_name }}" $setup SHA256SUMS --draft --title "Hesewake Media Bridge $env:VERSION" --notes-file notes.md
