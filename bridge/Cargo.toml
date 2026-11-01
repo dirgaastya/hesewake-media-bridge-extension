@@ -13,6 +13,19 @@ getrandom = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 mdns-sd = "0.11"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography"] }
+windows = { version = "0.58", features = [
+  "Foundation",
+  "Foundation_Collections",
+  "Media",
+  "Media_Control",
+  "Storage_Streams",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_System_LibraryLoader",
+  "Win32_System_WinRT",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [workspace]

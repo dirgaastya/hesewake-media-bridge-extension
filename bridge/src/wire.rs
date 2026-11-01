@@ -13,23 +13,29 @@ pub const MAX_TEXT: usize = 4096;
 pub const MAX_ARTWORK: usize = 262_144;
 const DOMAIN: &[u8] = b"hesewake-media-pair-v1";
 
-// ---------------------------------------------------------------- base64url without padding
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+// ---------------------------------------------------------------- base64
+// Two kinds, as the phone uses them: nonces and tokens are base64url without padding; the artwork is standard base64
+// (`+`, `/`, padded), as Android's `Base64.NO_WRAP` writes it.
+const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-pub fn b64_encode(data: &[u8]) -> String {
+fn encode_with(alphabet: &[u8; 64], data: &[u8], pad: bool) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let n = chunk.iter().enumerate().fold(0u32, |acc, (i, &b)| acc | (b as u32) << (16 - 8 * i));
         let chars = chunk.len() + 1;
         for i in 0..chars {
-            out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            out.push(alphabet[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+        if pad {
+            out.extend(std::iter::repeat('=').take(4 - chars));
         }
     }
     out
 }
 
-/// Decodes base64url, with or without padding. None for anything else.
-pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+/// Decodes with or without padding. None for anything else, and for text with stray bits (one text, one decoding).
+fn decode_with(alphabet: &[u8; 64], s: &str) -> Option<Vec<u8>> {
     let s = s.trim_end_matches('=');
     if s.len() % 4 == 1 {
         return None;
@@ -37,7 +43,7 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0);
     for c in s.bytes() {
-        let v = ALPHABET.iter().position(|&a| a == c)? as u32;
+        let v = alphabet.iter().position(|&a| a == c)? as u32;
         acc = acc << 6 | v;
         bits += 6;
         if bits >= 8 {
@@ -46,8 +52,25 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
             acc &= (1 << bits) - 1;
         }
     }
-    // leftover bits must be zero, so one text has one decoding
     (acc == 0).then_some(out)
+}
+
+/// base64url, no padding.
+pub fn b64_encode(data: &[u8]) -> String {
+    encode_with(URL, data, false)
+}
+
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    decode_with(URL, s)
+}
+
+/// Standard base64, padded.
+pub fn b64std_encode(data: &[u8]) -> String {
+    encode_with(STD, data, true)
+}
+
+pub fn b64std_decode(s: &str) -> Option<Vec<u8>> {
+    decode_with(STD, s)
 }
 
 // ---------------------------------------------------------------- the pairing code
@@ -240,7 +263,7 @@ fn parse_snapshot(v: &Value) -> Result<Snapshot, WireError> {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => {
             // base64 is a third bigger than what it holds: refuse before decoding something huge
-            if s.len() > MAX_ARTWORK / 3 * 4 + 8 || b64_decode(s).is_none_or(|b| b.len() > MAX_ARTWORK) {
+            if s.len() > MAX_ARTWORK / 3 * 4 + 8 || b64std_decode(s).is_none_or(|b| b.len() > MAX_ARTWORK) {
                 return Err(WireError::Field("artwork_base64"));
             }
             Some(s.clone())
@@ -321,6 +344,26 @@ mod tests {
         assert_eq!(b64_decode("AA+/"), None, "the standard alphabet is not base64url");
         assert_eq!(b64_decode("AB"), None, "stray bits: one text, one decoding");
         assert_eq!(b64_decode("A$AA"), None);
+    }
+
+    #[test]
+    fn artwork_is_standard_base64_like_android_writes_it() {
+        // these bytes make `+` and `/` in standard base64 and `-` and `_` in base64url
+        let bytes = [0xfb, 0xff, 0xbe, 0xfb, 0xef];
+        assert_eq!(b64std_encode(&bytes), "+/++++8=");
+        assert_eq!(b64_encode(&bytes), "-_----8");
+        assert_eq!(b64std_decode("+/++++8="), Some(bytes.to_vec()));
+        assert_eq!(b64std_decode("+/++++8"), Some(bytes.to_vec()), "padding is optional");
+        assert_eq!(b64std_decode("-_----8="), None, "the URL alphabet is not the standard one");
+        assert_eq!(b64_decode("+/++++8"), None);
+        for n in 0..40 {
+            let data: Vec<u8> = (0..n as u8).map(|i| i.wrapping_mul(91)).collect();
+            assert_eq!(b64std_decode(&b64std_encode(&data)), Some(data), "{n} bytes");
+        }
+        // a snapshot from the phone with such a picture is taken
+        let art = b64std_encode(&[0xfb, 0xff, 0xbe, 0xfb, 0xef, 0xff]);
+        assert!(art.contains('+') || art.contains('/'));
+        assert!(snap(json!({"artwork_mime": "image/jpeg", "artwork_base64": art})).is_ok());
     }
 
     #[test]
@@ -432,9 +475,9 @@ mod tests {
 
     #[test]
     fn artwork_is_limited_before_and_after_decoding() {
-        let ok = b64_encode(&vec![1u8; MAX_ARTWORK]);
+        let ok = b64std_encode(&vec![1u8; MAX_ARTWORK]);
         assert!(snap(json!({"artwork_mime": "image/png", "artwork_base64": ok})).is_ok());
-        let big = b64_encode(&vec![1u8; MAX_ARTWORK + 1]);
+        let big = b64std_encode(&vec![1u8; MAX_ARTWORK + 1]);
         assert_eq!(snap(json!({"artwork_base64": big})), Err(WireError::Field("artwork_base64")));
         let huge = "A".repeat(MAX_ARTWORK * 2);
         assert_eq!(snap(json!({"artwork_base64": huge})), Err(WireError::Field("artwork_base64")), "refused without decoding it");
