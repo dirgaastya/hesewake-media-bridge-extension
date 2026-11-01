@@ -97,6 +97,15 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// A random version 4 UUID in lower case (8-4-4-4-12): the phone refuses any other form of a command's id.
+fn uuid_v4() -> String {
+    let mut b = random::<16>();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex(&b);
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -199,7 +208,7 @@ impl Server {
 
     /// A command for the phone that is connected; its id, so the answer can be matched. None if no phone is there.
     pub fn send_command(&self, action: Action, position_ms: Option<u64>) -> Option<String> {
-        let id = hex(&random::<8>());
+        let id = uuid_v4();
         let a = self.inner.active.lock().ok()?;
         a.as_ref()?.tx.send(wire::command(&id, action, position_ms)).ok()?;
         Some(id)
@@ -686,6 +695,7 @@ mod tests {
         let Event::Snapshot(s) = r.event() else { panic!("a snapshot") };
         assert_eq!((s.title.as_str(), s.position_ms, s.playing), ("A Song", 1000, true));
         let id = r.server.send_command(Action::Seek, Some(30000)).expect("a phone is connected");
+        assert!(id.len() == 36 && id.chars().enumerate().all(|(i, c)| if [8, 13, 18, 23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() && !c.is_ascii_uppercase() }) && &id[14..15] == "4", "the phone only takes a UUID as a command's id");
         let c = p.recv().unwrap();
         assert_eq!((c["type"].as_str(), c["action"].as_str(), c["position_ms"].as_u64(), c["id"].as_str()), (Some("command"), Some("seek"), Some(30000), Some(id.as_str())));
         p.send("ack", json!({"id": id, "accepted": true}));
