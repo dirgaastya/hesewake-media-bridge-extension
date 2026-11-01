@@ -7,7 +7,7 @@ use hesewake_media_bridge::identity::Identity;
 use hesewake_media_bridge::media::{Playing, State};
 use hesewake_media_bridge::notch::{FromNotch, Link};
 use hesewake_media_bridge::server::{Event, Server, Timing};
-use hesewake_media_bridge::smtc::{Control, Publisher, View};
+use hesewake_media_bridge::smtc::{self, Control, Publisher, View};
 use hesewake_media_bridge::ui::{Do, Ui};
 use hesewake_media_bridge::wire::{b64std_decode, Action};
 use serde_json::json;
@@ -78,6 +78,8 @@ fn main() {
         }
     };
     let (ctl_tx, ctl_rx) = channel();
+    // the name Windows and the notch show as the source of the song
+    smtc::set_app_id(smtc::APP_ID);
     let publisher = Publisher::start(ctl_tx).map_err(|e| eprintln!("no media session: {e}")).ok();
 
     let (tx, rx) = channel::<Msg>();
@@ -95,6 +97,8 @@ fn main() {
     let mut ui = Ui::default();
     ui.set_devices(server.devices());
     let (mut visible, mut last_title) = (false, None::<(String, String)>);
+    // how long a snapshot takes to get here, from the pings; the song's position is moved on by it
+    let mut one_way = Duration::ZERO;
     let page = |ui: &mut Ui| link.send(&ui.page());
     let status = |ui: &Ui| link.send(&json!({"t": "status", "text": ui.status()}));
     let toast = |title: &str, sub: &str| link.send(&json!({"t": "toast", "title": title, "sub": sub}));
@@ -168,6 +172,7 @@ fn main() {
             Msg::Server(Event::Disconnected { .. }) => {
                 // a phone that signs in again is already the connected one by now
                 if server.connected().is_none() {
+                    one_way = Duration::ZERO;
                     ui.set_connected(None);
                     ui.set_playing(None);
                     last_title = None;
@@ -178,7 +183,8 @@ fn main() {
                 page(&mut ui);
                 status(&ui);
             }
-            Msg::Server(Event::Snapshot(s)) => match State::from_snapshot(&s, now) {
+            Msg::Server(Event::Latency(d)) => one_way = d,
+            Msg::Server(Event::Snapshot(s)) => match State::from_snapshot(&s, now, one_way) {
                 State::Idle => {
                     if let Some(p) = &publisher {
                         p.hide();

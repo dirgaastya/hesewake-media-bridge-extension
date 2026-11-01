@@ -30,7 +30,9 @@ pub enum State {
 }
 
 impl State {
-    pub fn from_snapshot(s: &Snapshot, received: Instant) -> State {
+    /// `one_way` is how long the snapshot took to get here: the song has gone on by that much since the phone read its
+    /// position (only while it plays, at its speed).
+    pub fn from_snapshot(s: &Snapshot, received: Instant, one_way: Duration) -> State {
         if !s.active {
             return State::Idle;
         }
@@ -44,7 +46,7 @@ impl State {
             playing: s.playing,
             speed: s.speed,
             actions: s.actions.clone(),
-            anchor_ms: s.position_ms,
+            anchor_ms: s.position_ms + if s.playing { (one_way.as_secs_f64() * 1000.0 * s.speed) as u64 } else { 0 },
             anchor: received,
         }))
     }
@@ -95,7 +97,7 @@ mod tests {
     }
 
     fn media(s: &Snapshot, at: Instant) -> Playing {
-        match State::from_snapshot(s, at) {
+        match State::from_snapshot(s, at, Duration::ZERO) {
             State::Media(p) => *p,
             State::Idle => panic!("idle"),
         }
@@ -139,8 +141,22 @@ mod tests {
     }
 
     #[test]
+    fn the_time_a_snapshot_took_is_added_while_it_plays() {
+        let t0 = Instant::now();
+        let s = snap(true, 42_000, true, 1.0, Some(200_000));
+        let State::Media(p) = State::from_snapshot(&s, t0, Duration::from_millis(35)) else { panic!() };
+        assert_eq!(p.position(t0), Duration::from_millis(42_035));
+        let fast = snap(true, 42_000, true, 2.0, None);
+        let State::Media(p) = State::from_snapshot(&fast, t0, Duration::from_millis(35)) else { panic!() };
+        assert_eq!(p.position(t0), Duration::from_millis(42_070), "at twice the speed it has gone twice as far");
+        let paused = snap(true, 42_000, false, 1.0, None);
+        let State::Media(p) = State::from_snapshot(&paused, t0, Duration::from_millis(35)) else { panic!() };
+        assert_eq!(p.position(t0), Duration::from_secs(42), "a paused song has not moved");
+    }
+
+    #[test]
     fn nothing_playing_is_idle() {
-        assert_eq!(State::from_snapshot(&snap(false, 0, false, 1.0, None), Instant::now()), State::Idle);
+        assert_eq!(State::from_snapshot(&snap(false, 0, false, 1.0, None), Instant::now(), Duration::ZERO), State::Idle);
     }
 
     #[test]

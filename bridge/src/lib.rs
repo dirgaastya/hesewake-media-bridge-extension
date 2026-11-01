@@ -3,6 +3,7 @@
 pub mod advert;
 pub mod dpapi;
 pub mod identity;
+pub mod latency;
 pub mod media;
 pub mod notch;
 pub mod pairing;

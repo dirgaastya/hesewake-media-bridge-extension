@@ -5,6 +5,7 @@
 //! One thread accepts, one thread per connection. A connection thread does everything for its phone, writing as well as
 //! reading, by waiting for data a short while at a time (`Timing::poll`), so a commands is sent within that while.
 
+use crate::latency::Latency;
 use crate::pairing::{Device, Devices, Gate};
 use crate::wire::{self, Action, FrameBuf, FromPhone, Snapshot};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -30,6 +31,8 @@ pub enum Event {
     Connected { id: String, name: String },
     Disconnected { id: String },
     Snapshot(Snapshot),
+    /// How long a message from the phone takes to get here now (one way), as far as the pings can tell.
+    Latency(Duration),
     /// The phone's answer to a command.
     Ack { id: String, accepted: bool, reason: String },
 }
@@ -354,6 +357,9 @@ impl Inner {
         let name = self.devices.lock().ok().and_then(|d| d.list().iter().find(|x| x.id == id).map(|x| x.name.clone())).unwrap_or_default();
         self.emit(Event::Connected { id: id.clone(), name });
         let (mut seen, mut pinged, mut last_seq) = (Instant::now(), Instant::now(), None::<u64>);
+        // a few quick pings first, so the delay is known when the first song arrives; then one now and then
+        let (mut latency, mut sent, mut burst) = (Latency::default(), Vec::<(String, Instant)>::new(), 4u32);
+        let mut burst_at = Instant::now();
         loop {
             if !self.active.lock().is_ok_and(|a| a.as_ref().is_some_and(|a| a.generation == generation)) {
                 break;
@@ -374,7 +380,14 @@ impl Inner {
                                 break;
                             }
                         }
-                        FromPhone::Pong { .. } => {}
+                        FromPhone::Pong { id } => {
+                            if let Some(i) = sent.iter().position(|(p, _)| *p == id) {
+                                let (_, at) = sent.remove(i);
+                                if let Some(d) = latency.add(at.elapsed()) {
+                                    self.emit(Event::Latency(d));
+                                }
+                            }
+                        }
                         FromPhone::Snapshot(s) => {
                             // `seq` only goes up: an old or repeated one is a phone that is confused, or something else
                             if last_seq.is_some_and(|l| s.seq <= l) {
@@ -389,9 +402,19 @@ impl Inner {
                     }
                 }
             }
-            if pinged.elapsed() >= self.timing.ping_every {
+            let due = if burst > 0 { burst_at.elapsed() >= Duration::from_millis(150) } else { pinged.elapsed() >= self.timing.ping_every };
+            if due {
+                let id = hex(&random::<8>());
+                if sent.len() >= 8 {
+                    sent.remove(0);
+                }
+                sent.push((id.clone(), Instant::now()));
+                if burst > 0 {
+                    burst -= 1;
+                    burst_at = Instant::now();
+                }
                 pinged = Instant::now();
-                if !c.send(&wire::ping(&hex(&random::<8>()))) {
+                if !c.send(&wire::ping(&id)) {
                     break;
                 }
             }
@@ -501,8 +524,23 @@ mod tests {
     }
 
     impl Rig {
+        /// The next event that is not a latency report (those come on their own as pings are answered).
         fn event(&self) -> Event {
-            self.events.recv_timeout(Duration::from_secs(4)).expect("an event")
+            loop {
+                match self.events.recv_timeout(Duration::from_secs(4)).expect("an event") {
+                    Event::Latency(_) => {}
+                    e => return e,
+                }
+            }
+        }
+
+        /// The next latency report.
+        fn latency(&self) -> Duration {
+            loop {
+                if let Event::Latency(d) = self.events.recv_timeout(Duration::from_secs(4)).expect("a latency report") {
+                    return d;
+                }
+            }
         }
 
         fn no_event(&self) {
@@ -715,6 +753,28 @@ mod tests {
         assert!(r.server.connected().is_some());
         // then goes quiet
         assert!(matches!(r.event(), Event::Disconnected { .. }), "35 s of nothing (here 0.9) ends it");
+    }
+
+    #[test]
+    fn the_round_trip_of_the_pings_is_measured() {
+        let r = rig(fast(), None);
+        let (token, _) = pair(&r);
+        let mut p = sign_in(&r, &token);
+        // a phone that answers each ping after a delay of its own: about 40 ms there and back
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut answered = 0;
+        while Instant::now() < until && answered < 3 {
+            if let Some(m) = p.recv().filter(|m| m["type"] == "ping") {
+                std::thread::sleep(Duration::from_millis(40));
+                p.send("pong", json!({"id": m["id"]}));
+                answered += 1;
+            }
+        }
+        let d = r.latency();
+        assert!(d >= Duration::from_millis(15) && d <= Duration::from_millis(120), "one way is about half of 40 ms plus the work of the test: {d:?}");
+        // a pong for a ping that was never sent says nothing
+        p.send("pong", json!({"id": "never-sent"}));
+        assert!(!matches!(r.events.recv_timeout(Duration::from_millis(300)), Ok(Event::Latency(_))), "no report from a made-up pong");
     }
 
     #[test]

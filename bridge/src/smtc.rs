@@ -7,7 +7,7 @@
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{factory, w, HSTRING};
 use windows::Foundation::TypedEventHandler;
 use windows::Media::{
@@ -23,6 +23,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_POPUP,
 };
 
+/// The name this program's media session goes by. Windows and the notch show it as the source of the song, so it is
+/// what the user reads ("Media from phone"), not the name of the exe. Set it before the session is made.
+pub const APP_ID: &str = "Media from phone";
+
+pub fn set_app_id(id: &str) {
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(id));
+    }
+}
+
 /// A button pressed in Windows (or in the notch), for the phone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Control {
@@ -31,6 +41,41 @@ pub enum Control {
     Next,
     Previous,
     Seek(Duration),
+}
+
+/// How far the position Windows would work out for itself may be from the phone's before it is told again.
+const SLACK: Duration = Duration::from_millis(200);
+
+/// What Windows was last told about the timeline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Told {
+    at: Instant,
+    position: Duration,
+    playing: bool,
+    speed: f64,
+    duration: Option<Duration>,
+    can_seek: bool,
+}
+
+impl Told {
+    fn of(v: &View, at: Instant) -> Told {
+        Told { at, position: v.position, playing: v.playing, speed: v.speed, duration: v.duration, can_seek: v.can_seek }
+    }
+
+    /// Where Windows puts the song now on its own: a playing song moves on at its speed.
+    fn expected(&self, now: Instant) -> Duration {
+        let moved = if self.playing { now.saturating_duration_since(self.at).mul_f64(self.speed.max(0.0)) } else { Duration::ZERO };
+        let pos = self.position + moved;
+        self.duration.map_or(pos, |d| pos.min(d))
+    }
+}
+
+/// Must Windows be told the timeline again? A playing song moves on by itself, so a snapshot that agrees with that
+/// (within `SLACK`) is left out: the small second-to-second differences of the network would only make the position, and
+/// the lyrics that follow it, jump about. A change of state, speed, length or the right to seek always goes through.
+pub fn timeline_needs_update(told: Option<&Told>, v: &View, now: Instant) -> bool {
+    let Some(t) = told else { return true };
+    t.playing != v.playing || t.speed != v.speed || t.duration != v.duration || t.can_seek != v.can_seek || t.expected(now).abs_diff(v.position.min(v.duration.unwrap_or(v.position))) > SLACK
 }
 
 /// What Windows is shown.
@@ -147,6 +192,7 @@ fn run(rx: Receiver<Msg>, controls: Sender<Control>, ready: Sender<Result<(), St
     };
     let _ = ready.send(Ok(()));
     let mut shown: Option<(String, String, String, bool)> = None;
+    let mut told: Option<Told> = None;
     loop {
         // Windows messages for the window, then what the program asked for
         unsafe {
@@ -158,11 +204,11 @@ fn run(rx: Receiver<Msg>, controls: Sender<Control>, ready: Sender<Result<(), St
         }
         match rx.recv_timeout(Duration::from_millis(25)) {
             Ok(Msg::Show(v)) => {
-                let _ = apply(&smtc, &v, &mut shown);
+                let _ = apply(&smtc, &v, &mut shown, &mut told);
             }
             Ok(Msg::Hide) => {
                 let _ = hide(&smtc);
-                shown = None;
+                (shown, told) = (None, None);
             }
             Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
@@ -181,7 +227,7 @@ fn hide(smtc: &SystemMediaTransportControls) -> windows::core::Result<()> {
     smtc.SetIsEnabled(false)
 }
 
-fn apply(smtc: &SystemMediaTransportControls, v: &View, shown: &mut Option<(String, String, String, bool)>) -> windows::core::Result<()> {
+fn apply(smtc: &SystemMediaTransportControls, v: &View, shown: &mut Option<(String, String, String, bool)>, told: &mut Option<Told>) -> windows::core::Result<()> {
     smtc.SetIsEnabled(true)?;
     smtc.SetIsPlayEnabled(v.can_play)?;
     smtc.SetIsPauseEnabled(v.can_pause)?;
@@ -213,6 +259,11 @@ fn apply(smtc: &SystemMediaTransportControls, v: &View, shown: &mut Option<(Stri
         du.Update()?;
         *shown = Some(key);
     }
+    let now = Instant::now();
+    if !timeline_needs_update(told.as_ref(), v, now) {
+        return Ok(());
+    }
+    *told = Some(Told::of(v, now));
     let end = v.duration.unwrap_or(v.position);
     let tl = SystemMediaTransportControlsTimelineProperties::new()?;
     tl.SetStartTime(Duration::ZERO.into())?;
@@ -228,8 +279,32 @@ fn apply(smtc: &SystemMediaTransportControls, v: &View, shown: &mut Option<(Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+
+    #[test]
+    fn windows_is_told_the_timeline_only_when_it_matters() {
+        let t0 = Instant::now();
+        let v = |pos: u64, playing: bool| View { position: Duration::from_secs(pos), ..view("x", playing) };
+        assert!(timeline_needs_update(None, &v(42, true), t0), "the first time");
+        let told = Told::of(&v(42, true), t0);
+        // 10 s later the phone says 52: exactly what Windows works out itself
+        assert!(!timeline_needs_update(Some(&told), &View { position: Duration::from_millis(52_100), ..v(0, true) }, t0 + Duration::from_secs(10)), "100 ms off: left alone");
+        assert!(timeline_needs_update(Some(&told), &View { position: Duration::from_millis(52_300), ..v(0, true) }, t0 + Duration::from_secs(10)), "300 ms off: told");
+        assert!(timeline_needs_update(Some(&told), &v(90, true), t0 + Duration::from_secs(10)), "a seek is told at once");
+        assert!(timeline_needs_update(Some(&told), &v(52, false), t0 + Duration::from_secs(10)), "pausing is told");
+        let paused = Told::of(&v(42, false), t0);
+        assert!(!timeline_needs_update(Some(&paused), &v(42, false), t0 + Duration::from_secs(30)), "a paused song stays where it is");
+        assert!(timeline_needs_update(Some(&paused), &v(50, false), t0 + Duration::from_secs(30)), "unless it was moved");
+        let mut other = v(42, true);
+        other.speed = 1.5;
+        assert!(timeline_needs_update(Some(&told), &other, t0), "a change of speed");
+        other = v(42, true);
+        other.duration = Some(Duration::from_secs(300));
+        assert!(timeline_needs_update(Some(&told), &other, t0), "another length");
+        // never past the end
+        let end = Told::of(&View { duration: Some(Duration::from_secs(60)), ..v(59, true) }, t0);
+        assert!(!timeline_needs_update(Some(&end), &View { duration: Some(Duration::from_secs(60)), ..v(60, true) }, t0 + Duration::from_secs(30)), "Windows stops at the end too");
+    }
 
     fn view(title: &str, playing: bool) -> View {
         View {
@@ -280,10 +355,13 @@ mod tests {
     #[ignore = "puts a made-up session in the user's media controls"]
     fn the_session_is_seen_by_windows_and_its_buttons_come_back() {
         let (ctl_tx, ctl_rx) = channel();
+        set_app_id(APP_ID);
         let p = Publisher::start(ctl_tx).expect("a publisher");
         let title = "Hesewake Bridge Test Song";
         p.show(view(title, false));
         let (artist, album, pos, end, playing) = wait_for(|| find(title)).expect("the session is listed");
+        let source = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().unwrap().get().unwrap().GetSessions().unwrap().into_iter().find(|s| s.TryGetMediaPropertiesAsync().unwrap().get().unwrap().Title().unwrap().to_string() == title).map(|s| s.SourceAppUserModelId().unwrap().to_string());
+        assert_eq!(source.as_deref(), Some(APP_ID), "the source of the song, as the notch reads it");
         assert_eq!((artist.as_str(), album.as_str(), pos, end, playing), ("Bridge Test Artist", "Bridge Test Album", 42, 200, false));
         // another song replaces the text, and the playing state follows
         p.show(view(title, true));
