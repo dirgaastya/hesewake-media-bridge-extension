@@ -29,6 +29,9 @@ pub struct Ui {
     pairing_left: Option<Duration>,
     /// The six digits of the pairing that waits for the user's decision.
     request: Option<String>,
+    /// This PC's name, and the QR code of the invitation (side and rows of `0` and `1`) while pairing is open.
+    computer: String,
+    invite: Option<(usize, Vec<String>)>,
     view: View,
 }
 
@@ -52,7 +55,7 @@ fn date(unix: u64) -> String {
 
 impl Default for Ui {
     fn default() -> Ui {
-        Ui { rev: 0, devices: Vec::new(), connected: None, playing: None, pairing_left: None, request: None, view: View::Home }
+        Ui { rev: 0, devices: Vec::new(), connected: None, playing: None, pairing_left: None, request: None, computer: String::new(), invite: None, view: View::Home }
     }
 }
 
@@ -74,8 +77,20 @@ impl Ui {
         self.playing = now;
     }
 
+    /// How long "Pair a phone" has left. When it has run out the code goes too.
     pub fn set_pairing_left(&mut self, left: Option<Duration>) {
         self.pairing_left = left;
+        if left.is_none() {
+            self.invite = None;
+        }
+    }
+
+    pub fn set_computer(&mut self, name: &str) {
+        self.computer = short(name, 40);
+    }
+
+    pub fn set_invite(&mut self, invite: Option<(usize, Vec<String>)>) {
+        self.invite = invite;
     }
 
     pub fn set_request(&mut self, code: Option<String>) {
@@ -124,6 +139,19 @@ impl Ui {
                 "foot": "Both sides must approve"
             });
         }
+        if let Some(left) = self.pairing_left {
+            let mut page = json!({
+                "t": "detail", "rev": rev, "for": "pairing", "title": "Pair a phone",
+                "meta": [{"k": "PC", "v": if self.computer.is_empty() { "this PC" } else { self.computer.as_str() }}, {"k": "Time left", "v": format!("{}:{:02}", left.as_secs() / 60, left.as_secs() % 60)}],
+                "body": "On your phone, open Hesewake Media Bridge and pick this PC, or scan the code.",
+                "buttons": [{"id": "pair_cancel", "label": "Cancel"}],
+                "foot": "Phones can only pair while this page is open"
+            });
+            if let Some((size, rows)) = &self.invite {
+                page["matrix"] = json!({"size": size, "rows": rows});
+            }
+            return page;
+        }
         if let View::Device(id) = self.view.clone() {
             if let Some(d) = self.devices.iter().find(|d| d.id == id) {
                 let on = self.connected.as_deref() == Some(id.as_str());
@@ -140,16 +168,15 @@ impl Ui {
             .iter()
             .map(|d| json!({"id": d.id, "text": short(&d.name, 60), "sub": if self.connected.as_deref() == Some(d.id.as_str()) { "Connected" } else { "Offline" }}))
             .collect();
-        let foot = match (&self.pairing_left, &self.playing) {
-            (Some(left), _) => format!("Waiting for a phone \u{b7} {}:{:02} left", left.as_secs() / 60, left.as_secs() % 60),
-            (None, Some((t, a))) => short(&format!("{t} \u{b7} {a}"), 100),
-            _ => String::new(),
+        let foot = match &self.playing {
+            Some((t, a)) => short(&format!("{t} \u{b7} {a}"), 100),
+            None => String::new(),
         };
-        let action = if self.pairing_left.is_some() { json!({"id": "pair_cancel", "label": "Cancel"}) } else { json!({"id": "pair", "label": "Pair a phone"}) };
+        let action = json!({"id": "pair", "label": "Pair a phone"});
         let mut page = json!({"t": "slide", "rev": rev, "title": "Pho|ne", "actions": [action], "rows": rows, "foot": foot});
         if self.devices.is_empty() {
             page["state"] = json!("empty");
-            page["message"] = json!(if self.pairing_left.is_some() { "Open Hesewake Media Bridge on your phone and pick this PC." } else { "No phone is paired yet. Press Pair a phone." });
+            page["message"] = json!("No phone is paired yet. Press Pair a phone.");
         }
         page
     }
@@ -211,12 +238,22 @@ mod tests {
         assert_eq!((p["t"].as_str(), p["state"].as_str(), p["actions"][0]["id"].as_str()), (Some("slide"), Some("empty"), Some("pair")));
         assert!(p["message"].as_str().unwrap().contains("Pair a phone"));
         assert_eq!(ui.status(), "No phone paired");
+        // while pairing is open the page is the invitation, with a QR code when there is one
+        ui.set_computer("THINKPAD");
         ui.set_pairing_left(Some(Duration::from_secs(95)));
         let p = ui.page();
-        assert_eq!(p["actions"][0]["id"], "pair_cancel");
-        assert_eq!(p["foot"], "Waiting for a phone \u{b7} 1:35 left");
-        assert!(p["message"].as_str().unwrap().contains("on your phone"));
+        assert_eq!((p["t"].as_str(), p["for"].as_str(), p["buttons"][0]["id"].as_str()), (Some("detail"), Some("pairing"), Some("pair_cancel")));
+        assert_eq!((p["meta"][0]["v"].as_str(), p["meta"][1]["v"].as_str()), (Some("THINKPAD"), Some("1:35")));
+        assert!(p.get("matrix").is_none(), "no network address, no code");
+        ui.set_invite(Some((2, vec!["10".into(), "01".into()])));
+        let p = ui.page();
+        assert_eq!((p["matrix"]["size"].as_u64(), p["matrix"]["rows"][1].as_str()), (Some(2), Some("01")));
         assert_eq!(ui.status(), "Waiting for a phone");
+        // when the time is out the code goes with it
+        ui.set_pairing_left(None);
+        assert_eq!(ui.page()["t"], "slide");
+        ui.set_pairing_left(Some(Duration::from_secs(5)));
+        assert!(ui.page().get("matrix").is_none(), "the old code is not shown again");
     }
 
     #[test]

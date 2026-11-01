@@ -3,6 +3,7 @@
 //! and keeps one slide in the notch for pairing and for the paired phones.
 
 use hesewake_media_bridge::advert::Advert;
+use hesewake_media_bridge::invite;
 use hesewake_media_bridge::identity::Identity;
 use hesewake_media_bridge::media::{Playing, State};
 use hesewake_media_bridge::notch::{FromNotch, Link};
@@ -95,7 +96,10 @@ fn main() {
     });
 
     let mut ui = Ui::default();
+    ui.set_computer(&computer);
     ui.set_devices(server.devices());
+    // the QR code of the invitation: where this PC is, and the fingerprint the phone pins
+    let invite_code = |server: &Server| invite::lan_address().and_then(|ip| invite::matrix(&invite::payload(&ip.to_string(), server.port(), &identity.fingerprint)));
     let (mut visible, mut last_title) = (false, None::<(String, String)>);
     // how long a snapshot takes to get here, from the pings; the song's position is moved on by it
     let mut one_way = Duration::ZERO;
@@ -123,12 +127,21 @@ fn main() {
                 }
             }
             Msg::Notch(FromNotch::Back) => {
+                // the invitation page is the one thing that is not left by going back to the list, so Back ends the pairing
+                if ui.pairing_open() && !ui.has_request() {
+                    server.close_pairing();
+                    ui.set_pairing_left(None);
+                }
                 ui.back();
                 page(&mut ui);
             }
             Msg::Notch(FromNotch::Action(id)) => {
                 match ui.action(&id) {
-                    Some(Do::OpenPairing) => server.open_pairing(),
+                    Some(Do::OpenPairing) => {
+                        server.open_pairing();
+                        ui.set_pairing_left(server.pairing_left());
+                        ui.set_invite(invite_code(&server));
+                    }
                     Some(Do::ClosePairing) => server.close_pairing(),
                     Some(Do::Decide(yes)) => server.decide(yes),
                     Some(Do::Forget(id)) => {
@@ -141,9 +154,7 @@ fn main() {
                 page(&mut ui);
                 status(&ui);
             }
-            Msg::Notch(FromNotch::Config) => {
-                toast("Media Bridge", "Pair phones from the Phone slide");
-            }
+            // its settings are in the panel of the Settings window, not in a window of its own
             Msg::Notch(_) => {}
             Msg::Server(Event::PairRequest { code }) => {
                 ui.set_request(Some(code.clone()));
