@@ -151,6 +151,11 @@ pub fn pair_decision(approved: bool) -> Vec<u8> {
     frame("pair_decision", json!({"approved": approved})).unwrap_or_default()
 }
 
+/// A phone's id for itself: 8 to 64 characters of letters, digits, `-` and `_`.
+pub fn valid_device_id(s: &str) -> bool {
+    (8..=64).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
 /// What this side does beyond the first version of the protocol. A phone only uses what it is told here, so a thing is
 /// listed only once it is done: `artwork_delta_v1` (a snapshot may say `artwork_same` instead of sending the picture again)
 /// and `forget_v1` (the phone may ask to be forgotten).
@@ -262,9 +267,9 @@ impl ArtworkKeep {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FromPhone {
-    PairHello { client_nonce: [u8; 32], device_name: Option<String> },
+    PairHello { client_nonce: [u8; 32], device_name: Option<String>, device_id: Option<String> },
     PairDecision { approved: bool },
-    Auth { token: [u8; 32], device_name: Option<String> },
+    Auth { token: [u8; 32], device_name: Option<String>, device_id: Option<String> },
     /// "Forget me": the phone asks to have its access taken away.
     Forget,
     Snapshot(Snapshot),
@@ -357,10 +362,12 @@ pub fn parse(payload: &[u8]) -> Result<FromPhone, WireError> {
     let id = || v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string).ok_or(WireError::Field("id"));
     // the name a phone gives itself is optional and only text; anything else is as good as none
     let device_name = || v.get("device_name").and_then(Value::as_str).filter(|s| s.len() <= MAX_TEXT).map(str::to_string);
+    // the phone's own id for itself, the same every time: 8 to 64 letters, digits, `-` and `_`; anything else is as good as none
+    let device_id = || v.get("device_id").and_then(Value::as_str).filter(|s| valid_device_id(s)).map(str::to_string);
     match v.get("type").and_then(Value::as_str).ok_or(WireError::Type)? {
-        "pair_hello" => Ok(FromPhone::PairHello { client_nonce: nonce(&v, "client_nonce")?, device_name: device_name() }),
+        "pair_hello" => Ok(FromPhone::PairHello { client_nonce: nonce(&v, "client_nonce")?, device_name: device_name(), device_id: device_id() }),
         "pair_decision" => Ok(FromPhone::PairDecision { approved: v.get("approved").and_then(Value::as_bool).ok_or(WireError::Field("approved"))? }),
-        "auth" => Ok(FromPhone::Auth { token: nonce(&v, "token")?, device_name: device_name() }),
+        "auth" => Ok(FromPhone::Auth { token: nonce(&v, "token")?, device_name: device_name(), device_id: device_id() }),
         "forget" => Ok(FromPhone::Forget),
         "snapshot" => Ok(FromPhone::Snapshot(parse_snapshot(&v)?)),
         "ack" => Ok(FromPhone::Ack {
@@ -462,11 +469,11 @@ mod tests {
     fn pairing_and_auth_messages() {
         let n = [7u8; 32];
         let hello = frame("pair_hello", json!({"client_nonce": b64_encode(&n)})).unwrap();
-        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n, device_name: None }));
+        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n, device_name: None, device_id: None }));
         let hello_short = frame("pair_hello", json!({"client_nonce": b64_encode(&n[..31])})).unwrap();
         assert_eq!(parse(&hello_short[4..]), Err(WireError::Field("client_nonce")), "32 bytes exactly");
         let auth = frame("auth", json!({"token": b64_encode(&n)})).unwrap();
-        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n, device_name: None }));
+        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n, device_name: None, device_id: None }));
         let d = frame("pair_decision", json!({"approved": true})).unwrap();
         assert_eq!(parse(&d[4..]), Ok(FromPhone::PairDecision { approved: true }));
         assert_eq!(parse(&frame("pair_decision", json!({"approved": "yes"})).unwrap()[4..]), Err(WireError::Field("approved")));
@@ -589,9 +596,9 @@ mod handoff_tests {
     fn a_phone_may_give_its_name_and_ask_to_be_forgotten() {
         let n = [5u8; 32];
         let hello = frame("pair_hello", json!({"client_nonce": b64_encode(&n), "device_name": "Pixel 9"})).unwrap();
-        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n, device_name: Some("Pixel 9".into()) }));
+        assert_eq!(parse(&hello[4..]), Ok(FromPhone::PairHello { client_nonce: n, device_name: Some("Pixel 9".into()), device_id: None }));
         let auth = frame("auth", json!({"token": b64_encode(&n), "device_name": 7})).unwrap();
-        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n, device_name: None }), "a name that is not text is no name, not an error");
+        assert_eq!(parse(&auth[4..]), Ok(FromPhone::Auth { token: n, device_name: None, device_id: None }), "a name that is not text is no name, not an error");
         let forget = frame("forget", json!({})).unwrap();
         assert_eq!(parse(&forget[4..]), Ok(FromPhone::Forget));
     }
@@ -644,5 +651,29 @@ mod handoff_tests {
         let mut first = snap(json!({"artwork_same": true}));
         fresh.resolve(&mut first);
         assert_eq!(first.artwork_base64, None, "a new connection starts with nothing kept");
+    }
+}
+
+#[cfg(test)]
+mod device_id_tests {
+    use super::*;
+
+    #[test]
+    fn a_phones_id_is_taken_only_when_it_looks_like_one() {
+        let n = [5u8; 32];
+        let with = |id: Value| {
+            let f = frame("pair_hello", json!({"client_nonce": b64_encode(&n), "device_id": id})).unwrap();
+            match parse(&f[4..]) {
+                Ok(FromPhone::PairHello { device_id, .. }) => device_id,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(with(json!("3f9a1c02e7b44d58")), Some("3f9a1c02e7b44d58".to_string()));
+        assert_eq!(with(json!("abc-DEF_123")), Some("abc-DEF_123".to_string()));
+        assert_eq!(with(json!("short")), None, "too short to be unique");
+        assert_eq!(with(json!("x".repeat(65))), None, "too long");
+        assert_eq!(with(json!("has space in it")), None);
+        assert_eq!(with(json!("a\u{0}bcdefghij")), None);
+        assert_eq!(with(json!(12345678)), None, "not text");
     }
 }

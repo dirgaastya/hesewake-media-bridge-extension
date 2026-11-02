@@ -88,6 +88,8 @@ pub struct Device {
     pub name: String,
     /// Unix seconds.
     pub added: u64,
+    /// The phone's own id for itself (what it sends as `device_id`), if it has sent one: how a phone that pairs again is known.
+    pub uid: Option<String>,
     hash: [u8; 32],
 }
 
@@ -148,8 +150,45 @@ impl Devices {
             id.push('x');
         }
         let name = name.map(clean_name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Phone {}", self.list.iter().filter_map(|d| d.name.strip_prefix("Phone ")?.parse::<u32>().ok()).max().unwrap_or(0) + 1));
-        self.list.push(Device { id, name, added: now_unix, hash });
+        self.list.push(Device { id, name, added: now_unix, uid: None, hash });
         self.list.last()
+    }
+
+    /// A phone that was just approved. If it has an id and a phone with that id is already here, it is the same phone pairing again: its
+    /// entry keeps its place and name and gets the new token (the old one stops working); otherwise it is a new entry. The id of the entry,
+    /// and whether it was one that existed. A new entry that cannot be made (no room) gives an empty id.
+    pub fn pair(&mut self, token: &[u8; 32], now_unix: u64, name: Option<&str>, uid: Option<&str>) -> (String, bool) {
+        let uid = uid.filter(|u| crate::wire::valid_device_id(u));
+        if let Some(i) = uid.and_then(|u| self.list.iter().position(|d| d.uid.as_deref() == Some(u))) {
+            self.list[i].hash = hash_of(token);
+            let id = self.list[i].id.clone();
+            if let Some(n) = name {
+                self.adopt_name(&id, n);
+            }
+            return (id, true);
+        }
+        let Some(d) = self.add_named(token, now_unix, name) else { return (String::new(), false) };
+        let id = d.id.clone();
+        if let Some(u) = uid {
+            if let Some(d) = self.list.iter_mut().find(|d| d.id == id) {
+                d.uid = Some(u.to_string());
+            }
+        }
+        (id, false)
+    }
+
+    /// The id a phone signs in with, for a phone that was paired before it sent ids. Only if the entry has none and no other entry has this one.
+    pub fn adopt_uid(&mut self, id: &str, uid: &str) -> bool {
+        if !crate::wire::valid_device_id(uid) || self.list.iter().any(|d| d.uid.as_deref() == Some(uid)) {
+            return false;
+        }
+        match self.list.iter_mut().find(|d| d.id == id) {
+            Some(d) if d.uid.is_none() => {
+                d.uid = Some(uid.to_string());
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A new name for a phone: control characters dropped, the ends trimmed, at most `MAX_NAME` characters. The cleaned name
@@ -187,7 +226,10 @@ impl Devices {
     }
 
     pub fn serialize(&self) -> String {
-        let devices: Vec<Value> = self.list.iter().map(|d| json!({"id": d.id, "name": d.name, "added": d.added, "hash": b64_encode(&d.hash)})).collect();
+        let devices: Vec<Value> = self.list.iter().map(|d| match &d.uid {
+            Some(u) => json!({"id": d.id, "name": d.name, "added": d.added, "uid": u, "hash": b64_encode(&d.hash)}),
+            None => json!({"id": d.id, "name": d.name, "added": d.added, "hash": b64_encode(&d.hash)}),
+        }).collect();
         json!({"devices": devices}).to_string()
     }
 
@@ -204,7 +246,8 @@ impl Devices {
                 continue;
             }
             let name = d.get("name").and_then(Value::as_str).unwrap_or("Phone").chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
-            list.push(Device { id: id.to_string(), name, added: d.get("added").and_then(Value::as_u64).unwrap_or(0), hash });
+            let uid = d.get("uid").and_then(Value::as_str).filter(|u| crate::wire::valid_device_id(u) && !list.iter().any(|x: &Device| x.uid.as_deref() == Some(*u))).map(str::to_string);
+            list.push(Device { id: id.to_string(), name, added: d.get("added").and_then(Value::as_u64).unwrap_or(0), uid, hash });
         }
         Devices { list }
     }
@@ -382,5 +425,82 @@ mod name_tests {
         assert_eq!(d.adopt_name(&named, ""), None);
         d.rename(&named, "My phone");
         assert_eq!(d.adopt_name(&named, "Pixel 9"), None);
+    }
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use super::*;
+
+    fn token(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn pairing_again_with_the_same_phone_id_keeps_one_entry_and_a_new_token() {
+        let mut d = Devices::default();
+        let (id1, again) = d.pair(&token(1), 10, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        assert!(!again);
+        let (id2, again) = d.pair(&token(2), 20, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        assert!(again, "the same phone");
+        assert_eq!(id1, id2, "the same entry, so the page and the name stay");
+        assert_eq!(d.list().len(), 1);
+        assert!(d.verify(&token(2)).is_some(), "the new token works");
+        assert!(d.verify(&token(1)).is_none(), "the old one is dead");
+        assert_eq!(d.list()[0].added, 10, "when it was first paired is kept");
+    }
+
+    #[test]
+    fn another_phone_or_one_without_an_id_is_another_entry() {
+        let mut d = Devices::default();
+        d.pair(&token(1), 0, None, Some("phone-aaaa-0001"));
+        d.pair(&token(2), 0, None, Some("phone-bbbb-0002"));
+        d.pair(&token(3), 0, None, None);
+        d.pair(&token(4), 0, None, None);
+        assert_eq!(d.list().len(), 4, "no id, nothing to tell phones apart by");
+    }
+
+    #[test]
+    fn a_renamed_phone_keeps_its_name_when_it_pairs_again() {
+        let mut d = Devices::default();
+        let (id, _) = d.pair(&token(1), 0, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        d.rename(&id, "Dirga's phone");
+        d.pair(&token(2), 0, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        assert_eq!(d.list()[0].name, "Dirga's phone");
+        // a phone that had only a number takes the name it brings now
+        let (id2, _) = d.pair(&token(3), 0, None, Some("phone-cccc-0003"));
+        assert_eq!(d.list().iter().find(|x| x.id == id2).unwrap().name, "Phone 1");
+        d.pair(&token(4), 0, Some("Galaxy"), Some("phone-cccc-0003"));
+        assert_eq!(d.list().iter().find(|x| x.id == id2).unwrap().name, "Galaxy");
+    }
+
+    #[test]
+    fn a_phone_paired_before_ids_gets_its_id_when_it_signs_in() {
+        let mut d = Devices::default();
+        let (id, _) = d.pair(&token(1), 0, None, None);
+        assert!(d.adopt_uid(&id, "phone-aaaa-0001"));
+        assert!(!d.adopt_uid(&id, "phone-zzzz-0009"), "an id is kept once it is known");
+        let (id2, again) = d.pair(&token(2), 0, None, Some("phone-aaaa-0001"));
+        assert!(again && id2 == id, "pairing again finds it");
+        // an id that another entry already has is not given to a second one
+        let other = d.pair(&token(5), 0, None, None).0;
+        assert!(!d.adopt_uid(&other, "phone-aaaa-0001"));
+    }
+
+    #[test]
+    fn the_id_survives_a_restart() {
+        let mut d = Devices::default();
+        d.pair(&token(1), 0, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        d.pair(&token(2), 0, Some("Old"), None);
+        let back = Devices::parse(&d.serialize());
+        assert_eq!(back, d);
+        let mut back = back;
+        let (_, again) = back.pair(&token(3), 0, None, Some("phone-aaaa-0001"));
+        assert!(again);
+        assert_eq!(back.list().len(), 2);
+        // a hand-edited id that is not valid is dropped, the phone stays
+        let broken = Devices::parse(&d.serialize().replace("phone-aaaa-0001", "bad id"));
+        assert_eq!(broken.list().len(), 2);
+        assert_eq!(broken.list()[0].uid, None);
     }
 }

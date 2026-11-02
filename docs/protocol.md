@@ -25,7 +25,7 @@ padding**.
 
 Only while the user pressed "Pair a phone" on the PC (two minutes); five failures lock it for a minute.
 
-1. phone: `pair_hello` `{client_nonce, device_name?}`
+1. phone: `pair_hello` `{client_nonce, device_name?, device_id?}`
 2. PC: `pair_challenge` `{server_nonce}`
 3. Both compute the code: the first 4 bytes (big-endian) of
    `SHA-256("hesewake-media-pair-v1" || fingerprint || client_nonce || server_nonce)`, modulo 1 000 000, six digits. Each
@@ -36,10 +36,15 @@ Only while the user pressed "Pair a phone" on the PC (two minutes); five failure
 
 `device_name` (optional text) becomes the phone's name on the PC unless the user has renamed it.
 
+`device_id` (optional, 8 to 64 characters of letters, digits, `-` and `_`) is the phone's own id for itself and must be **the same
+every time** (the reference app sends a hash of its Android ID). It is how a phone that pairs again is known: the PC keeps one entry
+for it (with its name and place), gives it the new token and kills the old one, instead of adding a second phone. A phone that sends
+none, or a bad one, is a new entry every time.
+
 ## Signing in
 
-phone: `auth` `{token, device_name?}` → PC: `auth_result` `{approved, capabilities?}`. A wrong token is refused after a short
-delay. A phone that signs in replaces the connection it had.
+phone: `auth` `{token, device_name?, device_id?}` → PC: `auth_result` `{approved, capabilities?}`. A wrong token is refused after a short
+delay. A phone that signs in replaces the connection it had. A phone that was paired before it sent a `device_id` gets the one it signs in with.
 
 `capabilities` is a list of optional features the PC supports; the phone uses only what it is told:
 

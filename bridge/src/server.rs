@@ -319,8 +319,8 @@ impl Inner {
             None => "nothing usable came (handshake not finished, too slow, or not our protocol)",
         }));
         let who = match first {
-            Some(FromPhone::PairHello { client_nonce, device_name }) => self.pair(&mut c, &client_nonce, device_name.as_deref()),
-            Some(FromPhone::Auth { token, device_name }) => self.auth(&mut c, &token, device_name.as_deref()),
+            Some(FromPhone::PairHello { client_nonce, device_name, device_id }) => self.pair(&mut c, &client_nonce, device_name.as_deref(), device_id.as_deref()),
+            Some(FromPhone::Auth { token, device_name, device_id }) => self.auth(&mut c, &token, device_name.as_deref(), device_id.as_deref()),
             _ => None,
         };
         if let Some(id) = who {
@@ -329,14 +329,14 @@ impl Inner {
     }
 
     /// A phone asks to pair. Some(id) once it is paired (the connection goes on as that phone).
-    fn pair(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>) -> Option<String> {
+    fn pair(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>, device_id: Option<&str>) -> Option<String> {
         let started = Instant::now();
         let begin = self.gate.lock().ok()?.begin(started);
         if let Err(why) = begin {
             crate::log::note(&format!("pairing refused: {why:?}"));
             return None;
         }
-        let paired = self.pair_inner(c, client_nonce, device_name, started);
+        let paired = self.pair_inner(c, client_nonce, device_name, device_id, started);
         crate::log::note(&format!("pairing ended: paired={}", paired.is_some()));
         if let Ok(mut g) = self.gate.lock() {
             g.end(paired.is_some(), Instant::now());
@@ -348,7 +348,7 @@ impl Inner {
         paired
     }
 
-    fn pair_inner(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>, started: Instant) -> Option<String> {
+    fn pair_inner(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>, device_id: Option<&str>, started: Instant) -> Option<String> {
         let server_nonce = random::<32>();
         if !c.send(&wire::pair_challenge(&server_nonce)) {
             return None;
@@ -375,7 +375,15 @@ impl Inner {
         let approved = phone == Some(true) && user == Some(true);
         let device = if approved {
             let token = random::<32>();
-            let added = self.devices.lock().ok().and_then(|mut d| d.add_named(&token, now_unix(), device_name).map(|d| d.id.clone()));
+            let added = self.devices.lock().ok().and_then(|mut d| {
+                let (id, again) = d.pair(&token, now_unix(), device_name, device_id);
+                (!id.is_empty()).then(|| {
+                    if again {
+                        crate::log::note(&format!("phone {id} paired again: its entry kept, the old token is dead"));
+                    }
+                    id
+                })
+            });
             added.map(|id| (id, token))
         } else {
             None
@@ -389,8 +397,14 @@ impl Inner {
     }
 
     /// A phone that was paired before. Some(id) if its token is good.
-    fn auth(&self, c: &mut Conn, token: &[u8; 32], device_name: Option<&str>) -> Option<String> {
+    fn auth(&self, c: &mut Conn, token: &[u8; 32], device_name: Option<&str>, device_id: Option<&str>) -> Option<String> {
         let id = self.devices.lock().ok()?.verify(token).map(|d| d.id.clone());
+        // a phone paired before it sent ids is known by the one it brings now
+        if let (Some(id), Some(uid)) = (&id, device_id) {
+            if self.devices.lock().ok().is_some_and(|mut d| d.adopt_uid(id, uid)) {
+                self.save_devices();
+            }
+        }
         // a phone that has not been given a name of its own takes the one it brings
         if let (Some(id), Some(name)) = (&id, device_name) {
             if self.devices.lock().ok().and_then(|mut d| d.adopt_name(id, name)).is_some() {
@@ -656,12 +670,19 @@ mod tests {
 
     /// Pair a phone to the end, with the name it gives (if any); returns its token and the code both sides saw.
     fn pair_as(r: &Rig, name: Option<&str>) -> ([u8; 32], String) {
+        pair_inner_test(r, name, None)
+    }
+
+    fn pair_inner_test(r: &Rig, name: Option<&str>, uid: Option<&str>) -> ([u8; 32], String) {
         r.server.open_pairing();
         let mut p = Phone::connect(r.server.port());
         assert_eq!(p.fingerprint(), r.fp, "the phone sees the certificate it will pin");
         let mut hello = json!({"client_nonce": wire::b64_encode(&NONCE)});
         if let Some(n) = name {
             hello["device_name"] = json!(n);
+        }
+        if let Some(u) = uid {
+            hello["device_id"] = json!(u);
         }
         p.send("pair_hello", hello);
         let ch = p.recv().expect("challenge");
@@ -833,6 +854,44 @@ mod tests {
         assert_eq!(reply(&mut p), json!({"v": 1, "type": "forget_result", "approved": false}));
         assert_eq!(r.server.devices().len(), 1, "it is still paired, since the change could not be made lasting");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pair_with(r: &Rig, name: Option<&str>, uid: Option<&str>) -> ([u8; 32], String) {
+        pair_inner_test(r, name, uid)
+    }
+
+    #[test]
+    fn pairing_again_with_the_same_phone_id_does_not_make_a_second_entry() {
+        let r = rig(fast(), None);
+        let (first, _) = pair_with(&r, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        assert_eq!(r.server.devices().len(), 1);
+        let id = r.server.devices()[0].id.clone();
+        drain(&r);
+        let (second, _) = pair_with(&r, Some("Pixel 9"), Some("phone-aaaa-0001"));
+        assert_ne!(first, second, "a new token");
+        assert_eq!(r.server.devices().len(), 1, "still one phone");
+        assert_eq!(r.server.devices()[0].id, id);
+        drain(&r);
+        let mut old = Phone::connect(r.server.port());
+        old.send("auth", json!({"token": wire::b64_encode(&first)}));
+        assert_eq!(reply(&mut old)["approved"], false, "the token from before is dead");
+        let _ = sign_in(&r, &second);
+        // another phone is another entry
+        drain(&r);
+        pair_with(&r, Some("Galaxy"), Some("phone-bbbb-0002"));
+        assert_eq!(r.server.devices().len(), 2);
+    }
+
+    #[test]
+    fn a_phone_paired_without_an_id_is_known_by_it_after_it_signs_in() {
+        let r = rig(fast(), None);
+        let (token, _) = pair(&r);
+        let mut p = Phone::connect(r.server.port());
+        p.send("auth", json!({"token": wire::b64_encode(&token), "device_id": "phone-aaaa-0001"}));
+        assert_eq!(reply(&mut p)["approved"], true);
+        drain(&r);
+        pair_with(&r, None, Some("phone-aaaa-0001"));
+        assert_eq!(r.server.devices().len(), 1, "it was found by the id it signed in with");
     }
 
     #[test]

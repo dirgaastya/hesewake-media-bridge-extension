@@ -148,6 +148,8 @@ fn main() {
     };
     let stored: Option<Value> = std::fs::read_to_string(FILE).ok().and_then(|t| serde_json::from_str(&t).ok());
     let name = arg("--name").unwrap_or_else(|| "Fake Phone".to_string());
+    // the same every run, as a real phone's id is: pairing again does not make a second entry
+    let id = arg("--id").unwrap_or_else(|| "fake-phone-0001".to_string());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().dangerous().with_custom_certificate_verifier(Arc::new(AnyCert)).with_no_client_auth();
     let tcp = TcpStream::connect((host.as_str(), port)).expect("connect");
@@ -167,7 +169,7 @@ fn main() {
         }
         Some(s) => {
             let token = s["token"].as_str().unwrap_or("");
-            c.send("auth", json!({"token": token, "device_name": name}));
+            c.send("auth", json!({"token": token, "device_name": name, "device_id": id}));
             let r = c.wait("auth_result");
             if r["approved"] != true {
                 println!("the PC does not know this phone any more (forgotten?); run with --forget to pair again");
@@ -178,7 +180,7 @@ fn main() {
         }
         None => {
             let nonce: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(std::process::id() as u8));
-            c.send("pair_hello", json!({"client_nonce": wire::b64_encode(&nonce), "device_name": name}));
+            c.send("pair_hello", json!({"client_nonce": wire::b64_encode(&nonce), "device_name": name, "device_id": id}));
             let ch = c.wait("pair_challenge");
             if ch["type"] != "pair_challenge" {
                 println!("the PC will not pair now: press \"Pair a phone\" in the notch first");
