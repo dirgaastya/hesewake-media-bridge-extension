@@ -310,7 +310,15 @@ impl Inner {
         let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
         let Ok(session) = ServerConnection::new(self.cfg.clone()) else { return };
         let mut c = Conn { tls: StreamOwned::new(session, tcp), fb: FrameBuf::default(), buf: vec![0u8; 16 * 1024] };
-        let who = match c.next(Instant::now() + self.timing.hello) {
+        let from = c.tls.sock.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+        let first = c.next(Instant::now() + self.timing.hello);
+        crate::log::note(&format!("connection from {from}: {}", match &first {
+            Some(FromPhone::PairHello { .. }) => "pair_hello",
+            Some(FromPhone::Auth { .. }) => "auth",
+            Some(_) => "another message first",
+            None => "nothing usable came (handshake not finished, too slow, or not our protocol)",
+        }));
+        let who = match first {
             Some(FromPhone::PairHello { client_nonce, device_name }) => self.pair(&mut c, &client_nonce, device_name.as_deref()),
             Some(FromPhone::Auth { token, device_name }) => self.auth(&mut c, &token, device_name.as_deref()),
             _ => None,
@@ -323,10 +331,13 @@ impl Inner {
     /// A phone asks to pair. Some(id) once it is paired (the connection goes on as that phone).
     fn pair(&self, c: &mut Conn, client_nonce: &[u8; 32], device_name: Option<&str>) -> Option<String> {
         let started = Instant::now();
-        if self.gate.lock().ok()?.begin(started).is_err() {
+        let begin = self.gate.lock().ok()?.begin(started);
+        if let Err(why) = begin {
+            crate::log::note(&format!("pairing refused: {why:?}"));
             return None;
         }
         let paired = self.pair_inner(c, client_nonce, device_name, started);
+        crate::log::note(&format!("pairing ended: paired={}", paired.is_some()));
         if let Ok(mut g) = self.gate.lock() {
             g.end(paired.is_some(), Instant::now());
         }
