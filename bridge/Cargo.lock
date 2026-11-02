@@ -260,6 +260,7 @@ name = "hesewake-media-bridge"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "if-addrs",
  "image",
  "mdns-sd",
  "qrcode",

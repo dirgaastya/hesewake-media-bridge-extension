@@ -33,11 +33,21 @@ fn host_label(computer: &str) -> String {
 }
 
 impl Advert {
-    pub fn start(computer: &str, port: u16) -> Result<Advert, String> {
+    /// Announce on the network. `addrs` are the addresses to tell (see `net::addresses`); with none, every address of this PC is told,
+    /// which is better than not being found at all.
+    pub fn start(computer: &str, port: u16, addrs: &[std::net::Ipv4Addr]) -> Result<Advert, String> {
         let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
+        // not on a tunnel or a virtual adapter: a phone cannot be there, and the answer would only point it the wrong way
+        for name in crate::net::virtual_adapters() {
+            let _ = daemon.disable_interface(name.as_str());
+        }
         let instance = instance_name(computer);
         let host = format!("{}.local.", host_label(computer));
-        let info = ServiceInfo::new(SERVICE, &instance, &host, "", port, &[("v", "1")][..]).map_err(|e| e.to_string())?.enable_addr_auto();
+        let ips = addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",");
+        let mut info = ServiceInfo::new(SERVICE, &instance, &host, ips.as_str(), port, &[("v", "1")][..]).map_err(|e| e.to_string())?;
+        if addrs.is_empty() {
+            info = info.enable_addr_auto();
+        }
         let fullname = info.get_fullname().to_string();
         daemon.register(info).map_err(|e| e.to_string())?;
         Ok(Advert { daemon, fullname })
@@ -76,7 +86,7 @@ mod tests {
     #[ignore = "needs multicast on the local network"]
     fn the_announcement_can_be_found() {
         let name = format!("BridgeTest{}", std::process::id());
-        let ad = Advert::start(&name, 45678).expect("announce");
+        let ad = Advert::start(&name, 45678, &crate::net::addresses()).expect("announce");
         let browser = ServiceDaemon::new().unwrap();
         let rx = browser.browse(SERVICE).unwrap();
         let until = Instant::now() + Duration::from_secs(8);

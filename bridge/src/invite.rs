@@ -5,7 +5,7 @@
 use crate::wire::{b64_encode, MAX_TEXT};
 use qrcode::{Color, EcLevel, QrCode};
 use serde_json::json;
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::Ipv4Addr;
 
 pub const PREFIX: &str = "hesewake-media:1:";
 
@@ -29,15 +29,9 @@ pub fn matrix(text: &str) -> Option<(usize, Vec<String>)> {
     Some((size, rows))
 }
 
-/// This PC's address on the network the phone can reach: the one the PC would use to go out. Nothing is sent; asking the
-/// system which address a route would start from is enough.
+/// This PC's address on the network the phone can reach: a real adapter's, not a tunnel's (see `net`).
 pub fn lan_address() -> Option<Ipv4Addr> {
-    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
-    s.connect("192.0.2.1:9").ok()?;
-    match s.local_addr().ok()?.ip() {
-        IpAddr::V4(a) if !a.is_loopback() && !a.is_unspecified() => Some(a),
-        _ => None,
-    }
+    crate::net::primary()
 }
 
 #[cfg(test)]

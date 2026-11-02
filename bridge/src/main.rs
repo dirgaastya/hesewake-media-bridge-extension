@@ -8,6 +8,7 @@ use hesewake_media_bridge::log;
 use hesewake_media_bridge::identity::Identity;
 use hesewake_media_bridge::media::{Playing, State};
 use hesewake_media_bridge::notch::{FromNotch, Link};
+use hesewake_media_bridge::port;
 use hesewake_media_bridge::server::{Event, Server, Timing};
 use hesewake_media_bridge::smtc::{self, Control, Publisher, View};
 use hesewake_media_bridge::thumb::Thumbs;
@@ -72,9 +73,20 @@ fn main() {
     let identity = Identity::load_or_create(&dir).expect("a TLS identity");
     let (ev_tx, ev_rx) = channel();
     let tls = hesewake_media_bridge::tls::server_config(&identity).expect("a TLS configuration");
-    let server = Server::start(tls, identity.fingerprint, Some(dir.join("devices.json")), ev_tx, "0.0.0.0:0".parse().unwrap(), Timing::default()).expect("a port to listen on");
+    // the same port as last time if it is free, so the address a phone remembers stays right; any free one if not
+    let start = |p: u16| Server::start(tls.clone(), identity.fingerprint, Some(dir.join("devices.json")), ev_tx.clone(), std::net::SocketAddr::from(([0, 0, 0, 0], p)), Timing::default());
+    let wanted = port::remembered(&dir);
+    let server = match start(wanted) {
+        Ok(s) => s,
+        Err(_) if wanted != 0 => start(0).expect("a port to listen on"),
+        Err(e) => panic!("a port to listen on: {e}"),
+    };
+    port::remember(&dir, server.port());
+    log::note(&format!("listening on port {}{}", server.port(), if server.port() == wanted { " (as before)" } else { "" }));
     let computer = std::env::var("COMPUTERNAME").unwrap_or_default();
-    let _advert = Advert::start(&computer, server.port()).map_err(|e| eprintln!("not announced on the network: {e}")).ok();
+    let addrs = hesewake_media_bridge::net::addresses();
+    log::note(&format!("addresses told to phones: {}; not used: {}", addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "), hesewake_media_bridge::net::virtual_adapters().join(", ")));
+    let _advert = Advert::start(&computer, server.port(), &addrs).map_err(|e| eprintln!("not announced on the network: {e}")).ok();
     let (link, notch_rx) = match Link::connect(&pipe, ID, NAME, env!("CARGO_PKG_VERSION")) {
         Ok(x) => x,
         Err(e) => {

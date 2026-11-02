@@ -6,6 +6,8 @@ pub mod identity;
 pub mod invite;
 pub mod latency;
 pub mod log;
+pub mod net;
+pub mod port;
 pub mod media;
 pub mod notch;
 pub mod pairing;
