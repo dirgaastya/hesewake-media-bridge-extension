@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.1.2] - 2026-11-03
+
+- The addresses told to phones follow the PC: every 5 s the bridge looks again, and when a VPN or another network comes or goes it announces the new addresses (and redraws the pairing code if it is on show). Before, they were read once at start, so a VPN that was up at that moment kept being announced after it went down, and phones could not find the PC.
+- OpenVPN (including its DCO adapter), NordLynx and Hamachi adapters are recognised as virtual, so their addresses are not told to phones.
+
 ## [0.1.1] - 2026-11-02
 
 - The phone keeps one entry when it pairs again: the bridge knows it by the `device_id` the phone sends, keeps its name and place, and kills the old token.
