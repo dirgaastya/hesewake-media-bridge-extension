@@ -6,8 +6,10 @@
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
 /// Adapters that are tunnels or virtual: a word in the name gives them away (a number after it, as in "wt0" or "tun1", does not count).
-const VIRTUAL_WORDS: [&str; 18] = [
+const VIRTUAL_WORDS: [&str; 22] = [
     "wt", "wg", "netbird", "wireguard", "wintun", "tailscale", "zerotier", "vpn", "vethernet", "vmware", "virtualbox", "vbox", "docker", "wsl", "hyper", "bluetooth", "tap", "tun",
+    // "OpenVPN Connect DCO Adapter" has no separate "vpn" or "tap" word, so the VPNs that name themselves in one word are listed
+    "openvpn", "dco", "nordlynx", "hamachi",
 ];
 
 /// True for the name of an adapter that is a tunnel or a virtual one, whose addresses a phone on the Wi-Fi cannot reach.
@@ -71,7 +73,7 @@ mod tests {
 
     #[test]
     fn tunnels_and_virtual_adapters_are_known_by_name() {
-        for v in ["wt0", "NetBird", "WireGuard Tunnel", "wg0", "Tailscale", "ZeroTier One", "vEthernet (WSL)", "vEthernet (Default Switch)", "VMware Network Adapter VMnet8", "VirtualBox Host-Only Network", "OpenVPN TAP-Windows6", "Local Area Connection* 10", "Bluetooth Network Connection", "tun0", "docker0"] {
+        for v in ["wt0", "NetBird", "WireGuard Tunnel", "wg0", "Tailscale", "ZeroTier One", "vEthernet (WSL)", "vEthernet (Default Switch)", "VMware Network Adapter VMnet8", "VirtualBox Host-Only Network", "OpenVPN TAP-Windows6", "Local Area Connection* 10", "Bluetooth Network Connection", "tun0", "docker0", "OpenVPN Connect DCO Adapter", "OpenVPN Data Channel Offload", "NordLynx", "Hamachi"] {
             assert!(is_virtual(v), "{v} is virtual");
         }
         for r in ["Wi-Fi", "Wi-Fi 2", "Ethernet", "Ethernet 3", "Local Area Connection", "WLAN", "en0", "Realtek PCIe GbE Family Controller", "Laptop LAN", "Intel(R) Wi-Fi 6 AX201"] {
