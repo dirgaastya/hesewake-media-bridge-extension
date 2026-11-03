@@ -1,6 +1,6 @@
 [package]
 name = "hesewake-media-bridge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Hesewake Media Bridge: media from an Android phone in Hesewake Notch, as an extension"
 license = "MIT"
